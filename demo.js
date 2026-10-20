@@ -46,7 +46,6 @@ function seedOldFloors(root) {
   const old = [
     ['/Users/demo/work/ai-playground', '프롬프트 실험 정리해줘', 40],
     ['/Users/demo/work/2d_boxing', '타격 판정 버그 좀 봐줘', 20],
-    ['/Users/demo/work/blog', '포스트 목록 페이지 만들어줘', 12],
   ];
   for (const [cwd, prompt, daysAgo] of old) {
     const dir = projectDir(root, cwd);
@@ -74,7 +73,7 @@ async function subagent(dir, sessionId, cwd, key, prompt, steps) {
 }
 
 async function mainScenario(root) {
-  const cwd = '/Users/demo/work/pokopia-town';
+  const cwd = '/Users/demo/work/cozy-town';
   const dir = projectDir(root, cwd);
   for (;;) {
     const sid = uuid();
@@ -86,7 +85,7 @@ async function mainScenario(root) {
     w.think('로그인 흐름부터 확인해야겠다. 토큰 갱신 쪽이 수상하다.');
     await sleep(2200);
     await w.run('Grep', { pattern: 'refreshToken', path: 'src' }, 'src/auth/session.ts\nsrc/api/client.ts', 1800);
-    await w.run('Read', { file_path: '/Users/demo/work/pokopia-town/src/auth/session.ts' }, '...', 2000);
+    await w.run('Read', { file_path: '/Users/demo/work/cozy-town/src/auth/session.ts' }, '...', 2000);
 
     // 서브에이전트 두 명에게 나눠 맡긴다
     const exPrompt = '인증 관련 파일과 토큰 갱신 호출 위치를 전부 찾아서 정리해줘';
@@ -123,14 +122,14 @@ async function mainScenario(root) {
       { content: '테스트 실행', status: 'pending' },
       { content: '커밋', status: 'pending' },
     ] }, 'ok', 2200);
-    await w.run('Edit', { file_path: '/Users/demo/work/pokopia-town/src/auth/session.ts' }, 'ok', 3000);
-    await w.run('Edit', { file_path: '/Users/demo/work/pokopia-town/src/auth/interceptor.ts' }, 'ok', 2600);
+    await w.run('Edit', { file_path: '/Users/demo/work/cozy-town/src/auth/session.ts' }, 'ok', 3000);
+    await w.run('Edit', { file_path: '/Users/demo/work/cozy-town/src/auth/interceptor.ts' }, 'ok', 2600);
     await w.run('Bash', { command: 'npm test -- auth', description: '인증 테스트 실행' },
       'FAIL src/auth/session.test.ts\n  ✕ refresh twice (12 ms)\n  Expected 1 call, received 2', 4200, true);
     w.think('테스트가 실패했다. 인터셉터가 아직 예전 함수를 부른다.');
     await sleep(2600);
-    await w.run('Read', { file_path: '/Users/demo/work/pokopia-town/src/auth/interceptor.ts' }, '...', 1600);
-    await w.run('Edit', { file_path: '/Users/demo/work/pokopia-town/src/auth/interceptor.ts' }, 'ok', 2400);
+    await w.run('Read', { file_path: '/Users/demo/work/cozy-town/src/auth/interceptor.ts' }, '...', 1600);
+    await w.run('Edit', { file_path: '/Users/demo/work/cozy-town/src/auth/interceptor.ts' }, 'ok', 2400);
     await w.run('Bash', { command: 'npm test -- auth', description: '인증 테스트 다시 실행' }, 'PASS 12 tests', 4200);
     await w.run('TodoWrite', { todos: [
       { content: '토큰 갱신 single-flight 적용', status: 'completed' },
@@ -164,7 +163,7 @@ async function sideScenario(root) {
 }
 
 function start() {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'pokeai-demo-'));
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'clawd-village-demo-'));
   seedOldFloors(root);
   mainScenario(root).catch(e => console.error('demo:', e));
   setTimeout(() => sideScenario(root).catch(e => console.error('demo:', e)), 300);

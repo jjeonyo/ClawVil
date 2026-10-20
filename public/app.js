@@ -1,6 +1,6 @@
 // 세션 기록을 받아 캐릭터를 움직이고, 층 안내·사람 목록·활동 로그를 그린다.
 import { buildWorld, findPath, render, iso, GW, GH, ROOMS, THEMES, themeForFloor } from './world.js';
-import { SPECIES, speciesForAgent } from './pokemon.js';
+import { SPECIES, speciesForAgent, portrait } from './critters.js';
 
 const POLL_MS = 250;
 const FLOORS_MS = 2000;
@@ -76,7 +76,13 @@ function describeTool(name, i = {}) {
   }
 }
 
-const LONG_TOOLS = new Set(['Bash', 'BashOutput', 'Monitor', 'Task', 'Agent', 'WebFetch', 'WebSearch', 'AskUserQuestion', 'SendMessage']);
+const RESUMED_QUIET_MS = 30000;   // 다시 일하러 간 서브에이전트가 이만큼 조용하면 끝난 것으로 본다
+// Claude Code는 명령이 도는 동안 기록을 쓰지 않는다. 끝나지 않은 도구가 있으면 이 시간까지는 일하는 중으로 본다.
+const WAIT_MS = 30 * 60e3;
+
+const CLAUDE_PROPS = { library: 'glasses', dev: 'hardhat', server: 'headset', info: 'antenna', meeting: 'beret' };
+
+const LONG_TOOLS = new Set(['Bash', 'BashOutput', 'Monitor', 'PowerShell', 'TaskOutput', 'Task', 'Agent', 'WebFetch', 'WebSearch', 'AskUserQuestion', 'SendMessage']);
 
 // ---------------------------------------------------------------- 캐릭터
 
@@ -115,10 +121,23 @@ class Town {
     this.userTypingUntil = 0;
     this.dirty = true;
 
-    this.user = this.add(new Agent({ id: 'user', kind: 'user', species: 'trainer', label: opts.userName + ' (나)', color: '#e8483f', speed: 2.5 }));
+    this.user = this.add(new Agent({ id: 'user', kind: 'user', species: 'human', label: opts.userName + ' (나)', color: SPECIES.human.color, speed: 2.5 }));
     this.place(this.user, world.userSeat);
-    this.claude = this.add(new Agent({ id: 'claude', kind: 'claude', species: 'ditto', label: 'Claude', color: CLAUDE_COLOR }));
+    this.claude = this.add(new Agent({ id: 'claude', kind: 'claude', species: 'clawd', label: 'Claude', color: CLAUDE_COLOR }));
     this.place(this.claude, world.claudeSeat);
+
+    // 마을 주민: 쉼터에서 자는 양, 연못가를 뛰어다니는 개구리, 헤엄치는 오리
+    const sheep = this.add(new Agent({ id: 'sheep', kind: 'npc', species: 'sheep', label: '' }));
+    this.place(sheep, world.napSpot);
+    sheep.emote = 'sleep';
+    if (world.frogSpots.length) {
+      this.frog = this.add(new Agent({ id: 'frog', kind: 'npc', species: 'frog', label: '', speed: 1.6 }));
+      this.place(this.frog, world.frogSpots[0]);
+      this.frog.nextHop = performance.now() + 4000;
+    }
+    this.duck = this.add(new Agent({ id: 'duck', kind: 'npc', species: 'duck', label: '', speed: 0.45 }));
+    this.duck.loopIndex = 0;
+    this.place(this.duck, world.duckLoop[0]);
   }
 
   add(a) { this.chars.push(a); return a; }
@@ -211,9 +230,12 @@ class Town {
       || cands.find(s => meta.prompt && norm(s.prompt) === norm(meta.prompt))
       || cands[0];
     if (!a) {
-      // Task 호출이 읽은 범위 밖에 있었던 경우: 기록만 보고 데려온다
+      // Task 호출이 읽은 범위 밖에 있었던 경우: 기록만 보고 데려온다. 호출 결과는 agentId로 찾아 잇고,
+      // 그마저 없으면 다시 일하러 간 서브에이전트처럼 한동안 조용할 때 보고하러 간다 (updateSubs)
       a = this.spawnSub({ id: 'file:' + key, t: ev && ev.t, input: { subagent_type: meta.agentType || '', description: short(meta.prompt, 20), prompt: meta.prompt } }, true);
+      if (!meta.agentId) a.resumed = true;
     }
+    if (meta.agentId) a.agentId = meta.agentId;
     a.fileKey = key;
     this.subByFile.set(key, a);
     return a;
@@ -227,8 +249,9 @@ class Town {
     if (!a || a.gone) return;
     a.lastAt = now;
     if (a.kind === 'sub' && (a.state === 'reporting' || a.state === 'leaving') && (ev.k === 'tool' || ev.k === 'think')) {
-      // 보고하러 가다가 일을 하나 더 받으면 다시 일하러 돌아간다
-      a.state = 'working'; a.alpha = 1; a.emote = null;
+      // 보고하러 가다가 일을 하나 더 받으면 다시 일하러 돌아간다. 이때는 끝났다는 신호(Task 결과)가 다시 오지 않으므로
+      // 기록이 한동안 멈추면 알아서 다시 보고하러 간다 (updateSubs)
+      a.state = 'working'; a.alpha = 1; a.emote = null; a.eyes = null; a.mouth = null; a.resumed = true;
       this.log(a, '↩️ 일이 더 생겨서 돌아가요', { t: ev.t });
     }
 
@@ -298,8 +321,15 @@ class Town {
 
   onResult(ev) {
     const p = this.pending.get(ev.id);
-    const sub = this.subs.get(ev.id);
-    if (sub && !sub.gone) this.finishSub(sub, ev);
+    const sub = this.subs.get(ev.id)
+      || (ev.agent ? [...this.subs.values()].find(s => s.agentId === ev.agent && !s.gone && s.state !== 'reporting' && s.state !== 'leaving') : null);
+    if (sub && !sub.gone) {
+      if (ev.async) {
+        // 백그라운드 서브에이전트: 호출 결과는 시작할 때 바로 온다. 끝은 기록이 멈추는 것으로 판단한다.
+        sub.resumed = true;
+        this.log(sub, '🌙 백그라운드에서 일하는 중');
+      } else { sub.resumed = false; this.finishSub(sub, ev); }
+    }
     if (!p) return;
     this.pending.delete(ev.id);
     const a = p.agent;
@@ -324,7 +354,6 @@ class Town {
     const a = this.add(new Agent({
       id: ev.id, kind: 'sub', type, species, color: SPECIES[species].color,
       label: short(type, 16), desc: i.description || '', prompt: i.prompt || '',
-      glasses: /plan/i.test(type), hat: /explore/i.test(type),
       activity: '출근 중', state: 'arriving', speed: 3.2, since: ev.t || Date.now(),
     }));
     this.subs.set(ev.id, a);
@@ -340,10 +369,12 @@ class Town {
       this.elevatorUntil = Date.now() + 1800;
       this.place(a, this.world.elevatorDoor);
       a.hidden = false; a.alpha = 0;
+      a.poofT = performance.now() / 1000; a.eyes = 'happy';
       a.say('say', '안녕하세요! 출근했어요', 2200);
       this.log(a, `🛗 출근 · ${a.desc}`);
       this.later(450, null, () => {
         a.alpha = 1;
+        this.later(1400, null, () => { if (a.eyes === 'happy') a.eyes = null; });
         if (a.state === 'arriving') { a.state = 'working'; a.activity = '일하러 가는 중'; this.goRoom(a, room, () => { if (room === 'library') a.emote = 'read'; }); }
       });
     });
@@ -361,18 +392,20 @@ class Town {
       if (a.state !== 'reporting') return;
       a.facing = a.x < this.claude.x ? 1 : -1;
       a.say(ev.err ? 'err' : 'report', (ev.err ? '죄송해요… ' : '보고: ') + (ev.text || '다 했어요!'), 3200);
+      if (!ev.err) { a.eyes = 'happy'; this.cheer(); } else a.mouth = 'worried';
       this.log(a, (ev.err ? '😓 ' : '📋 ') + 'Claude에게 보고', { err: ev.err });
       this.later(3200, a, () => {
         if (a.state !== 'reporting') return;
         a.say('say', '👋 퇴근합니다!', 2000); a.emote = 'wave';
         this.later(1600, a, () => {
           if (a.state !== 'reporting') return;
-          a.state = 'leaving'; a.activity = '퇴근 중'; a.emote = null;
+          a.state = 'leaving'; a.activity = '퇴근 중'; a.emote = null; a.eyes = null; a.mouth = null;
           this.release(a);
           this.walk(a, this.world.elevatorDoor, () => {
             if (a.state !== 'leaving') return;
             this.elevatorUntil = Date.now() + 1500;
             this.log(a, '🛗 퇴근');
+            a.poofT = performance.now() / 1000;
             this.later(350, a, () => { a.alpha = 0.4; });
             this.later(700, a, () => this.removeSub(a));
           });
@@ -390,14 +423,23 @@ class Town {
     this.dirty = true;
   }
 
-  endTurn(msg, t) {
+  endTurn(msg, t, quiet = false) {
     this.turnActive = false;
     for (const [id, p] of this.pending) if (p.agent === this.claude) this.pending.delete(id);
     const c = this.claude;
     c.state = 'idle'; c.activity = '대기 중'; c.emote = null; c.mouth = null; c.since = Date.now();
     if (msg) { c.say('say', msg, 2500); this.log(c, msg, { t }); }
+    else if (!quiet) this.cheer();
     if (c.bubble && c.bubble.until === Infinity) c.bubble = null;
     this.goRoom(c, 'desk');
+  }
+
+  // Claude가 잠깐 > < 눈으로 웃는다 (서브에이전트 보고를 받을 때, 답변을 마칠 때)
+  cheer(ms = 2600) {
+    const c = this.claude;
+    if (this.replaying) return;
+    c.eyes = 'happy';
+    this.later(ms, null, () => { if (c.eyes === 'happy') c.eyes = null; });
   }
 
   // 처음 열 때 지나간 기록을 순식간에 재생해 현재 상태를 맞춘다
@@ -407,10 +449,10 @@ class Town {
     this.replaying = false;
     for (const ch of this.chars) ch.bubble = null;
     const quietFor = Date.now() - (this.lastEventAt || 0);
-    if (!sessionActive || quietFor > 10 * 60e3) {
+    if (!((sessionActive && quietFor <= 10 * 60e3) || this.waiting())) {
       for (const a of [...this.subs.values()]) this.removeSub(a);
       this.pending.clear();
-      if (this.turnActive || this.claude.state !== 'idle') this.endTurn(null);
+      if (this.turnActive || this.claude.state !== 'idle') this.endTurn(null, undefined, true);
       this.place(this.claude, this.world.claudeSeat);
     } else {
       // 진행 중인 도구가 있으면 그 말풍선을 다시 띄운다
@@ -421,6 +463,11 @@ class Town {
     }
     this.claude.since = this.lastEventAt || Date.now();
     this.dirty = true;
+  }
+
+  // 기록은 멈췄지만 끝나지 않은 도구(긴 명령, 서브에이전트 호출 등)를 기다리는 중인가
+  waiting() {
+    return this.turnActive && this.pending.size > 0 && Date.now() - (this.lastEventAt || 0) < WAIT_MS;
   }
 
   // -------- 매 프레임
@@ -461,7 +508,39 @@ class Town {
     }
     if (c.state === 'idle' && !c.moving) c.emote = now - c.since > 3 * 60e3 ? 'sleep' : (c.emote === 'sleep' ? null : c.emote);
     if (c.emote === 'phone' && now > this.phoneUntil) c.emote = null;
+    // 방마다 쓰는 작업 소품
+    c.prop = c.arrived && c.state === 'working' ? (CLAUDE_PROPS[c.room] || null) : null;
+    this.updateNpcs(pnow);
+    this.updateSubs(now, live);
     this.world.elevatorOpen += ((now < this.elevatorUntil ? 1 : 0) - this.world.elevatorOpen) * Math.min(1, dt * 6);
+  }
+
+  updateSubs(now, live) {
+    for (const a of this.subs.values()) {
+      if (!a.resumed || a.gone || a.state !== 'working' || a.moving) continue;
+      const busy = [...this.pending.values()].some(p => p.agent === a);
+      const quiet = now - a.lastAt;
+      // 끝나지 않은 도구가 있어도 결과가 끝내 안 오면(4MB 넘는 줄, 도중에 끈 경우) WAIT_MS 뒤에는 끝난 것으로 본다
+      if (busy ? quiet > WAIT_MS : (quiet > RESUMED_QUIET_MS || !live)) { a.resumed = false; this.finishSub(a, { text: '', err: false }); }
+    }
+  }
+
+  updateNpcs(pnow) {
+    const f = this.frog;
+    if (f && !f.moving && pnow > f.nextHop) {
+      const spots = this.world.frogSpots;
+      const near = spots.filter(s => Math.hypot(s.x - f.x, s.y - f.y) < 3.5 && (s.x !== f.x || s.y !== f.y));
+      const to = (near.length ? near : spots)[Math.floor(Math.random() * (near.length || spots.length))];
+      f.path = [to];
+      f.onArrive = () => { f.facing = Math.random() < 0.5 ? 1 : -1; };
+      f.nextHop = pnow + 5000 + Math.random() * 7000;
+    }
+    const d = this.duck;
+    if (d && !d.moving) {
+      d.loopIndex = (d.loopIndex + 1) % this.world.duckLoop.length;
+      d.path = [this.world.duckLoop[d.loopIndex]];
+      d.onArrive = null;
+    }
   }
 
   liveFlags(floorLabel, userName) {
@@ -582,7 +661,7 @@ async function refreshFloors() {
         // /clear 하면 같은 층의 새 세션으로 따라간다
         const newest = [...f.sessions].sort((a, b) => b.birth - a.birth)[0];
         const cur = f.sessions.find(s => s.id === app.session);
-        if (app.autoFollow && newest && newest.id !== app.session && (!cur || newest.birth > cur.birth)) {
+        if (app.autoFollow && !app.riding && newest && cur && newest.id !== app.session && newest.birth > cur.birth) {
           toast(`🆕 ${f.floor}F 새 세션으로 따라갑니다`);
           openSession(f, newest.id);
         }
@@ -591,17 +670,28 @@ async function refreshFloors() {
     renderFloors();
     renderHeader();
     $('#empty').hidden = app.floors.length > 0;
+    $('#emptyRoot').textContent = data.root;
   } catch (e) {
     console.warn(e);
   }
 }
 
+function newestStarted(f) {
+  const newest = [...f.sessions].sort((a, b) => b.birth - a.birth)[0];
+  return newest && newest.id;
+}
+
 async function enterFloor(f, sessionId, animate = true) {
   const prev = app.floor ? app.floor.floor : 1;
   if (sessionId === undefined || sessionId === null) app.autoFollow = true;
+  // 따로 고르지 않았으면 자동 따라가기와 같은 기준(가장 나중에 시작한 세션)으로 연다
+  const sid = sessionId || newestStarted(f);
+  // 엘리베이터가 도는 동안에는 이전 층에 머문다. 층과 세션은 도착할 때 함께 바꾼다.
+  if (animate && prev !== f.floor) {
+    app.riding = true;
+    try { await elevatorRide(prev, f.floor); } finally { app.riding = false; }
+  }
   app.floor = f;
-  const sid = sessionId || (f.sessions[0] && f.sessions[0].id);
-  if (animate && prev !== f.floor) await elevatorRide(prev, f.floor);
   openSession(f, sid);
   renderFloors();
 }
@@ -660,10 +750,11 @@ async function poll(token, floorId, sid) {
     if (token !== app.sessionToken) return;
     const town = app.town;
     Object.assign(town.subsMeta, data.subs || {});
-    app.sessionActive = data.session.active;
     if (data.reset) { openSession(app.floor, sid); return; }
     if (first || data.initial) { town.replay(data.events, data.session.active); first = false; }
     else for (const ev of data.events) town.handle(ev);
+    // 기록 파일이 2분 넘게 조용해도 끝나지 않은 도구를 기다리는 중이면 LIVE로 본다
+    app.sessionActive = data.session.active || town.waiting();
     app.cursor = data.cursor;
     renderHeader();
     if (!data.session.more) await sleep(POLL_MS);
@@ -695,8 +786,9 @@ function renderFloors() {
   const old = sorted.filter(f => !recent.includes(f));
   const item = f => {
     const cur = app.floor && f.id === app.floor.id;
-    let html = `<li class="floor ${cur ? 'current' : ''} ${f.active ? 'lit' : ''}" data-floor="${esc(f.id)}">
-      <div class="frow"><span class="fnum">${f.floor}F</span><span class="fname">${esc(f.name)}</span><span class="light" title="${f.active ? '지금 일하는 중' : '불 꺼짐'}"></span></div>
+    const lit = f.active || (cur && app.sessionActive);
+    let html = `<li class="floor ${cur ? 'current' : ''} ${lit ? 'lit' : ''}" data-floor="${esc(f.id)}">
+      <div class="frow"><span class="fnum">${f.floor}F</span><span class="fname">${esc(f.name)}</span><span class="light" title="${lit ? '지금 일하는 중' : '불 꺼짐'}"></span></div>
       <div class="fmeta">세션 ${f.sessionCount}개 · ${ago(now - f.lastActive)}</div>`;
     if (cur) {
       const list = app.showAllSessions ? f.sessions : f.sessions.slice(0, 8);
@@ -713,6 +805,24 @@ function renderFloors() {
     (old.length ? `<li class="oldtoggle" data-old="1">${app.showOld ? '▾' : '▸'} 불 꺼진 지 오래된 층 ${old.length}개</li>` + (app.showOld ? old.map(item).join('') : '') : '');
 }
 
+// 이미 열린 탭에서 북마크를 누르거나 주소창의 #floor=… 를 고치면 그 층·세션으로 옮긴다
+window.addEventListener('hashchange', () => {
+  const h = new URLSearchParams(location.hash.slice(1));
+  const f = app.floors.find(x => x.id === h.get('floor'));
+  if (!f) return;
+  const want = h.get('session');
+  const sid = want && f.sessions.some(s => s.id === want) ? want : null;
+  if (app.floor && f.id === app.floor.id) {
+    if (sid ? sid === app.session && !app.autoFollow : app.autoFollow) return;
+    app.autoFollow = !sid;
+    openSession(f, sid || newestStarted(f));
+    renderFloors();
+    return;
+  }
+  app.autoFollow = !sid;
+  enterFloor(f, sid, true);
+});
+
 $('#floors').addEventListener('click', e => {
   const t = e.target.closest('[data-session],[data-follow],[data-more],[data-old],[data-floor]');
   if (!t) return;
@@ -721,7 +831,9 @@ $('#floors').addEventListener('click', e => {
   if (t.dataset.more) { app.showAllSessions = !app.showAllSessions; return renderFloors(); }
   if (t.dataset.follow) {
     app.autoFollow = !app.autoFollow;
-    if (app.autoFollow && app.floor.sessions[0] && app.floor.sessions[0].id !== app.session) openSession(app.floor, app.floor.sessions[0].id);
+    const newest = newestStarted(app.floor);
+    if (app.autoFollow && newest && newest !== app.session) openSession(app.floor, newest);
+    else history.replaceState(null, '', `#floor=${encodeURIComponent(app.floor.id)}${app.autoFollow ? '' : '&session=' + encodeURIComponent(app.session)}`);
     return renderFloors();
   }
   if (t.dataset.session) {
@@ -736,11 +848,18 @@ $('#floors').addEventListener('click', e => {
 
 const STATE_LABEL = { working: '작업 중', idle: '대기', arriving: '출근 중', reporting: '보고 중', leaving: '퇴근 중' };
 
+// 패널에 쓰는 캐릭터 얼굴 그림 (한 번 그려 두고 재사용)
+const portraits = new Map();
+function portraitUrl(species) {
+  if (!portraits.has(species)) portraits.set(species, portrait(species, 40).toDataURL());
+  return portraits.get(species);
+}
+
 function renderPeople() {
   const town = app.town;
   if (!town) return;
   const now = Date.now();
-  const people = town.chars.filter(c => c.kind !== 'user' && !c.hidden || c.kind === 'sub');
+  const people = town.chars.filter(c => c.kind === 'claude' || c.kind === 'sub');
   $('#peopleCount').textContent = `${people.length}명 근무 중`;
   $('#people').innerHTML = people.map(a => {
     let st = STATE_LABEL[a.state] || a.state;
@@ -749,7 +868,7 @@ function renderPeople() {
     if (a.sweat) st = '진땀';
     const sp = SPECIES[a.species];
     return `<li class="person">
-      <span class="avatar" style="background:${a.color}">${a.kind === 'claude' ? 'C' : esc((a.type || '?')[0].toUpperCase())}</span>
+      <span class="avatar" style="border-color:${a.color}"><img src="${portraitUrl(a.species)}" alt=""></span>
       <div class="pbody">
         <div class="prow"><b>${esc(a.kind === 'claude' ? 'Claude' : a.type)}</b><span class="species">${esc(sp ? sp.name : '')}</span><span class="pill s-${esc(a.state)} ${a.sweat ? 'err' : ''}">${esc(st)}</span></div>
         ${a.desc ? `<div class="pdesc">${esc(a.desc)}</div>` : ''}
@@ -770,12 +889,10 @@ function renderLogs() {
 
 function renderLegend() {
   const rooms = ['library', 'dev', 'server', 'info', 'meeting', 'lobby', 'elevator'];
+  const cast = [['clawd', 'Claude', '방마다 작업 모자'], ['sprout', 'Explore', '탐험 모자 · 돋보기'], ['owl', 'Plan', '안경 · 설계도'],
+    ['bunny', '범용', '파란 목도리'], ['chick', '그 밖의 에이전트', ''], ['human', '나', '']];
   $('#legend').innerHTML = rooms.map(k => `<li><span>${ROOMS[k].icon}</span><b>${ROOMS[k].name}</b><em>${ROOMS[k].desc}</em></li>`).join('') +
-    `<li class="cast"><span>🟣</span><b>메타몽</b><em>Claude</em></li>
-     <li class="cast"><span>🌱</span><b>이상해씨</b><em>Explore · 모자</em></li>
-     <li class="cast"><span>👻</span><b>팬텀</b><em>Plan · 안경</em></li>
-     <li class="cast"><span>⚡</span><b>피카츄</b><em>범용 에이전트</em></li>
-     <li class="cast"><span>🦊</span><b>이브이</b><em>그 밖의 에이전트</em></li>`;
+    cast.map(([sp, who, note]) => `<li class="cast"><img src="${portraitUrl(sp)}" alt=""><b>${SPECIES[sp].name}</b><em>${who}${note ? ' · ' + note : ''}</em></li>`).join('');
 }
 
 let toastTimer = null;

@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// PokeAI — Claude Code 세션 기록(jsonl)을 따라 읽어 포코피아풍 마을로 보여주는 로컬 서버.
+// 클로드봇 마을 — Claude Code 세션 기록(jsonl)을 따라 읽어 블록 마을로 보여주는 로컬 서버.
 // 외부 패키지 없음. 훅/설정을 건드리지 않고 ~/.claude/projects 아래 파일을 읽기만 한다.
 'use strict';
 
@@ -11,6 +11,8 @@ const os = require('os');
 const args = parseArgs(process.argv.slice(2));
 const PORT = Number(args.port || process.env.PORT || 4848);
 const HOST = args.host || '127.0.0.1';
+// Host 헤더에서는 IPv6 주소가 [::1] 처럼 대괄호로 싸여 온다
+const HOST_HEADER = HOST.includes(':') && !HOST.startsWith('[') ? `[${HOST}]` : HOST;
 const PUBLIC_DIR = path.join(__dirname, 'public');
 
 let ROOT = args.dir || process.env.CLAUDE_PROJECTS_DIR ||
@@ -20,6 +22,7 @@ if (args.demo) ROOT = require('./demo').start();
 const ACTIVE_MS = 2 * 60 * 1000;       // 마지막 기록 후 이 시간 안이면 "불 켜진" 세션
 const INITIAL_TAIL = 2 * 1024 * 1024;      // 처음 열 때 메인 세션 끝부분만 읽는다
 const SUB_INITIAL_TAIL = 128 * 1024;
+const SUB_RECENT_MS = 30 * 60 * 1000;  // 처음 열 때 이 시간 안에 쓰인 서브에이전트 기록만 읽는다
 const MAX_CHUNK = 4 * 1024 * 1024;     // 한 번의 폴링에서 읽는 최대 바이트
 const HEAD_BYTES = 64 * 1024;
 const NAME_RE = /^[A-Za-z0-9._-]+$/;
@@ -33,6 +36,8 @@ function parseArgs(argv) {
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (!a.startsWith('--')) continue;
+    const eq = a.indexOf('=');
+    if (eq > 2) { out[a.slice(2, eq)] = a.slice(eq + 1); continue; }   // --port=5000
     const key = a.slice(2);
     const next = argv[i + 1];
     if (next && !next.startsWith('--')) { out[key] = next; i++; } else out[key] = true;
@@ -145,7 +150,8 @@ function compact(rec, src) {
         for (const b of c) {
           if (!b || b.type !== 'tool_result') continue;
           out.push({ ...base, k: 'result', id: b.tool_use_id, err: !!b.is_error,
-            text: clip(resultText(b.content), 240), agent: tur && tur.agentId ? String(tur.agentId) : undefined });
+            text: clip(resultText(b.content), 240), agent: tur && tur.agentId ? String(tur.agentId) : undefined,
+            async: !!(tur && (tur.isAsync || tur.status === 'async_launched')) });
         }
       }
       const p = cleanPrompt(userText(c));
@@ -205,6 +211,19 @@ function sessionInfo(file, st) {
   return info;
 }
 
+// 세션의 서브에이전트 기록 가운데 가장 최근에 바뀐 시각. 서브에이전트만 일하는 동안에도 불이 켜져 있게 한다.
+function newestSubagentWrite(floorDir, sessionId, oldFormat) {
+  let newest = 0;
+  try {
+    const dir = path.join(floorDir, sessionId, 'subagents');
+    for (const f of fs.readdirSync(dir)) {
+      if (!f.endsWith('.jsonl')) continue;
+      try { newest = Math.max(newest, fs.statSync(path.join(dir, f)).mtimeMs); } catch { /* 지워짐 */ }
+    }
+  } catch { /* 하위 폴더 없음 */ }
+  return Math.max(newest, oldFormat.get(sessionId) || 0);
+}
+
 // 디렉터리 이름(-Users-me-work-app)에서 경로를 대충 복원한다. 실제 cwd가 기록에 있으면 그걸 쓴다.
 function guessCwd(dirName) { return dirName.replace(/-/g, '/'); }
 
@@ -219,6 +238,16 @@ function listFloors() {
     let files;
     try { files = fs.readdirSync(dir, { withFileTypes: true }); } catch { continue; }
     const sessions = [];
+    // 예전 형식(agent-*.jsonl)의 서브에이전트 기록: 최근 것만 어느 세션 것인지 확인한다
+    const oldFormat = new Map();
+    for (const f of files) {
+      if (!f.isFile() || !f.name.startsWith('agent-') || !f.name.endsWith('.jsonl')) continue;
+      let st;
+      try { st = fs.statSync(path.join(dir, f.name)); } catch { continue; }
+      if (now - st.mtimeMs > ACTIVE_MS) continue;
+      const sid = subagentHead(path.join(dir, f.name), st).sessionId;
+      if (sid) oldFormat.set(sid, Math.max(oldFormat.get(sid) || 0, st.mtimeMs));
+    }
     for (const f of files) {
       if (!f.isFile() || !f.name.endsWith('.jsonl') || f.name.startsWith('agent-')) continue;
       const id = f.name.slice(0, -6);
@@ -228,8 +257,10 @@ function listFloors() {
       try { st = fs.statSync(file); } catch { continue; }
       const info = sessionInfo(file, st);
       if (!info.hasMessages) continue;
+      // 하루 넘게 조용한 세션은 서브에이전트 폴더까지 뒤지지 않는다
+      const mtime = now - st.mtimeMs < 86400e3 ? Math.max(st.mtimeMs, newestSubagentWrite(dir, id, oldFormat)) : st.mtimeMs;
       sessions.push({ id, title: info.title || '제목 없는 세션', cwd: info.cwd, birth: info.birth,
-        mtime: st.mtimeMs, active: now - st.mtimeMs < ACTIVE_MS });
+        mtime, active: now - mtime < ACTIVE_MS });
     }
     if (!sessions.length) continue;
     sessions.sort((a, b) => b.mtime - a.mtime);
@@ -339,17 +370,20 @@ function sessionDelta(floorId, sessionId, cursor) {
   const subsMeta = {};
   const prevSubs = (cursor && cursor.s) || {};
   const now = Date.now();
+  let lastWrite = main.mtime;
   for (const sub of findSubagents(floorDir, sessionId)) {
     let st;
     try { st = fs.statSync(sub.file); } catch { continue; }
+    lastWrite = Math.max(lastWrite, st.mtimeMs);
     const head = subagentHead(sub.file, st);
     subsMeta[sub.key] = { prompt: head.prompt, agentId: head.agentId, agentType: sub.agentType || '', mtime: st.mtimeMs };
     let off = prevSubs[sub.key];
     let tail = null;
     if (typeof off !== 'number') {
       if (initial) {
-        // 처음 열 때: 끝난 지 오래된 서브에이전트는 건너뛰고, 최근 것만 끝부분을 읽는다
-        if (now - st.mtimeMs > 60 * 1000) off = st.size; else { off = null; tail = SUB_INITIAL_TAIL; }
+        // 처음 열 때: 끝난 지 오래된 서브에이전트는 건너뛰고, 최근 것만 끝부분을 읽는다.
+        // 긴 명령을 기다리는 동안에는 기록이 멈추므로 넉넉하게 30분까지 본다.
+        if (now - st.mtimeMs > SUB_RECENT_MS) off = st.size; else { off = null; tail = SUB_INITIAL_TAIL; }
       } else off = 0; // 새로 생긴 서브에이전트
     }
     const r = readNew(sub.file, off, tail);
@@ -363,7 +397,7 @@ function sessionDelta(floorId, sessionId, cursor) {
     reset: main.reset,
     cursor: { m: main.offset, s: nextSubs },
     subs: subsMeta,
-    session: { id: sessionId, mtime: main.mtime, active: now - main.mtime < ACTIVE_MS, more: main.offset < main.size },
+    session: { id: sessionId, mtime: lastWrite, active: now - lastWrite < ACTIVE_MS, more: main.offset < main.size },
   };
 }
 
@@ -392,8 +426,9 @@ function serveStatic(req, res, pathname) {
 const server = http.createServer((req, res) => {
   const url = new URL(req.url, 'http://localhost');
   // 다른 사이트가 이 서버를 읽어 가지 못하도록 Host 헤더를 확인한다 (DNS 리바인딩 방지)
-  const host = (req.headers.host || '').split(':')[0];
-  if (!['localhost', '127.0.0.1', '[::1]', HOST].includes(host)) { res.writeHead(403); return res.end(); }
+  const rawHost = req.headers.host || '';
+  const host = rawHost.startsWith('[') ? rawHost.slice(0, rawHost.indexOf(']') + 1) : rawHost.split(':')[0];
+  if (!['localhost', '127.0.0.1', '[::1]', HOST_HEADER].includes(host)) { res.writeHead(403); return res.end(); }
   try {
     if (url.pathname === '/api/floors') {
       return sendJson(res, 200, { root: ROOT, user: userName(), demo: !!args.demo, now: Date.now(), floors: listFloors() });
@@ -415,7 +450,16 @@ const server = http.createServer((req, res) => {
   }
 });
 
+server.on('error', e => {
+  const why = { EADDRINUSE: `포트 ${PORT}을 이미 다른 프로그램이 쓰고 있어요. --port 로 다른 포트를 주세요.`,
+    EADDRNOTAVAIL: `이 PC에 ${HOST} 주소가 없어요. --host 값을 확인하세요.`,
+    EAFNOSUPPORT: `이 PC에서 ${HOST} 주소 형식을 쓸 수 없어요 (IPv6가 꺼져 있을 수 있어요).`,
+    EACCES: `포트 ${PORT}을 열 권한이 없어요. 1024 이상의 포트를 쓰세요.` }[e.code];
+  console.error(`\n  서버를 열지 못했어요: ${why || e.message}\n`);
+  process.exit(1);
+});
+
 server.listen(PORT, HOST, () => {
-  console.log(`\n  🏝️  PokeAI 마을이 열렸어요 → http://localhost:${PORT}`);
+  console.log(`\n  🏝️  클로드봇 마을이 열렸어요 → http://localhost:${PORT}`);
   console.log(`      읽는 위치: ${ROOT}${args.demo ? ' (데모)' : ''}\n`);
 });

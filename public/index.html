@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>PokeAI 마을</title>
+  <title>클로드봇 마을</title>
   <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🏝️</text></svg>">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Gowun+Dodum&family=Jua&display=swap">
@@ -37,7 +37,7 @@
       <div id="toast"></div>
       <div id="empty" hidden>
         <h2>아직 마을이 비어 있어요</h2>
-        <p>Claude Code 세션 기록(<code>~/.claude/projects</code>)을 찾지 못했어요.<br>
+        <p>Claude Code 세션 기록(<code id="emptyRoot">~/.claude/projects</code>)을 찾지 못했어요.<br>
           Claude Code를 한 번 실행하거나, <code>node server.js --demo</code> 로 데모를 볼 수 있어요.</p>
       </div>
     </main>
