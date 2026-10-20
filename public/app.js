@@ -80,7 +80,7 @@ const RESUMED_QUIET_MS = 30000;   // 다시 일하러 간 서브에이전트가 
 
 const CLAUDE_PROPS = { library: 'glasses', dev: 'hardhat', server: 'headset', info: 'antenna', meeting: 'beret' };
 
-const LONG_TOOLS = new Set(['Bash', 'BashOutput', 'Monitor', 'Task', 'Agent', 'WebFetch', 'WebSearch', 'AskUserQuestion', 'SendMessage']);
+const LONG_TOOLS = new Set(['Bash', 'BashOutput', 'Monitor', 'PowerShell', 'TaskOutput', 'Task', 'Agent', 'WebFetch', 'WebSearch', 'AskUserQuestion', 'SendMessage']);
 
 // ---------------------------------------------------------------- 캐릭터
 
@@ -228,9 +228,12 @@ class Town {
       || cands.find(s => meta.prompt && norm(s.prompt) === norm(meta.prompt))
       || cands[0];
     if (!a) {
-      // Task 호출이 읽은 범위 밖에 있었던 경우: 기록만 보고 데려온다
+      // Task 호출이 읽은 범위 밖에 있었던 경우: 기록만 보고 데려온다. 호출 결과는 agentId로 찾아 잇고,
+      // 그마저 없으면 다시 일하러 간 서브에이전트처럼 한동안 조용할 때 보고하러 간다 (updateSubs)
       a = this.spawnSub({ id: 'file:' + key, t: ev && ev.t, input: { subagent_type: meta.agentType || '', description: short(meta.prompt, 20), prompt: meta.prompt } }, true);
+      a.resumed = true;
     }
+    if (meta.agentId) a.agentId = meta.agentId;
     a.fileKey = key;
     this.subByFile.set(key, a);
     return a;
@@ -316,8 +319,9 @@ class Town {
 
   onResult(ev) {
     const p = this.pending.get(ev.id);
-    const sub = this.subs.get(ev.id);
-    if (sub && !sub.gone) this.finishSub(sub, ev);
+    const sub = this.subs.get(ev.id)
+      || (ev.agent ? [...this.subs.values()].find(s => s.agentId === ev.agent && !s.gone && s.state !== 'reporting' && s.state !== 'leaving') : null);
+    if (sub && !sub.gone) { sub.resumed = false; this.finishSub(sub, ev); }
     if (!p) return;
     this.pending.delete(ev.id);
     const a = p.agent;
