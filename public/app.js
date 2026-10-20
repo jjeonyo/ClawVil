@@ -377,7 +377,7 @@ class Town {
       if (a.state !== 'reporting') return;
       a.facing = a.x < this.claude.x ? 1 : -1;
       a.say(ev.err ? 'err' : 'report', (ev.err ? '죄송해요… ' : '보고: ') + (ev.text || '다 했어요!'), 3200);
-      if (!ev.err) a.eyes = 'happy'; else a.mouth = 'worried';
+      if (!ev.err) { a.eyes = 'happy'; this.cheer(); } else a.mouth = 'worried';
       this.log(a, (ev.err ? '😓 ' : '📋 ') + 'Claude에게 보고', { err: ev.err });
       this.later(3200, a, () => {
         if (a.state !== 'reporting') return;
@@ -408,14 +408,23 @@ class Town {
     this.dirty = true;
   }
 
-  endTurn(msg, t) {
+  endTurn(msg, t, quiet = false) {
     this.turnActive = false;
     for (const [id, p] of this.pending) if (p.agent === this.claude) this.pending.delete(id);
     const c = this.claude;
     c.state = 'idle'; c.activity = '대기 중'; c.emote = null; c.mouth = null; c.since = Date.now();
     if (msg) { c.say('say', msg, 2500); this.log(c, msg, { t }); }
+    else if (!quiet) this.cheer();
     if (c.bubble && c.bubble.until === Infinity) c.bubble = null;
     this.goRoom(c, 'desk');
+  }
+
+  // Claude가 잠깐 > < 눈으로 웃는다 (서브에이전트 보고를 받을 때, 답변을 마칠 때)
+  cheer(ms = 2600) {
+    const c = this.claude;
+    if (this.replaying) return;
+    c.eyes = 'happy';
+    this.later(ms, null, () => { if (c.eyes === 'happy') c.eyes = null; });
   }
 
   // 처음 열 때 지나간 기록을 순식간에 재생해 현재 상태를 맞춘다
@@ -428,7 +437,7 @@ class Town {
     if (!sessionActive || quietFor > 10 * 60e3) {
       for (const a of [...this.subs.values()]) this.removeSub(a);
       this.pending.clear();
-      if (this.turnActive || this.claude.state !== 'idle') this.endTurn(null);
+      if (this.turnActive || this.claude.state !== 'idle') this.endTurn(null, undefined, true);
       this.place(this.claude, this.world.claudeSeat);
     } else {
       // 진행 중인 도구가 있으면 그 말풍선을 다시 띄운다
@@ -621,7 +630,7 @@ async function refreshFloors() {
         // /clear 하면 같은 층의 새 세션으로 따라간다
         const newest = [...f.sessions].sort((a, b) => b.birth - a.birth)[0];
         const cur = f.sessions.find(s => s.id === app.session);
-        if (app.autoFollow && newest && newest.id !== app.session && (!cur || newest.birth > cur.birth)) {
+        if (app.autoFollow && !app.riding && newest && cur && newest.id !== app.session && newest.birth > cur.birth) {
           toast(`🆕 ${f.floor}F 새 세션으로 따라갑니다`);
           openSession(f, newest.id);
         }
@@ -638,9 +647,13 @@ async function refreshFloors() {
 async function enterFloor(f, sessionId, animate = true) {
   const prev = app.floor ? app.floor.floor : 1;
   if (sessionId === undefined || sessionId === null) app.autoFollow = true;
-  app.floor = f;
   const sid = sessionId || (f.sessions[0] && f.sessions[0].id);
-  if (animate && prev !== f.floor) await elevatorRide(prev, f.floor);
+  // 엘리베이터가 도는 동안에는 이전 층에 머문다. 층과 세션은 도착할 때 함께 바꾼다.
+  if (animate && prev !== f.floor) {
+    app.riding = true;
+    try { await elevatorRide(prev, f.floor); } finally { app.riding = false; }
+  }
+  app.floor = f;
   openSession(f, sid);
   renderFloors();
 }

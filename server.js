@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// 모찌마을 — Claude Code 세션 기록(jsonl)을 따라 읽어 블록 마을로 보여주는 로컬 서버.
+// 클로드봇 마을 — Claude Code 세션 기록(jsonl)을 따라 읽어 블록 마을로 보여주는 로컬 서버.
 // 외부 패키지 없음. 훅/설정을 건드리지 않고 ~/.claude/projects 아래 파일을 읽기만 한다.
 'use strict';
 
@@ -416,6 +416,6 @@ const server = http.createServer((req, res) => {
 });
 
 server.listen(PORT, HOST, () => {
-  console.log(`\n  🏝️  모찌마을이 열렸어요 → http://localhost:${PORT}`);
+  console.log(`\n  🏝️  클로드봇 마을이 열렸어요 → http://localhost:${PORT}`);
   console.log(`      읽는 위치: ${ROOT}${args.demo ? ' (데모)' : ''}\n`);
 });
