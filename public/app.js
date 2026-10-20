@@ -119,7 +119,7 @@ class Town {
 
     this.user = this.add(new Agent({ id: 'user', kind: 'user', species: 'human', label: opts.userName + ' (나)', color: SPECIES.human.color, speed: 2.5 }));
     this.place(this.user, world.userSeat);
-    this.claude = this.add(new Agent({ id: 'claude', kind: 'claude', species: 'mochi', label: 'Claude', color: CLAUDE_COLOR }));
+    this.claude = this.add(new Agent({ id: 'claude', kind: 'claude', species: 'clawd', label: 'Claude', color: CLAUDE_COLOR }));
     this.place(this.claude, world.claudeSeat);
 
     // 마을 주민: 쉼터에서 자는 양, 연못가를 뛰어다니는 개구리, 헤엄치는 오리
@@ -816,7 +816,7 @@ function renderLogs() {
 
 function renderLegend() {
   const rooms = ['library', 'dev', 'server', 'info', 'meeting', 'lobby', 'elevator'];
-  const cast = [['mochi', 'Claude', '방마다 작업 모자'], ['sprout', 'Explore', '탐험 모자 · 돋보기'], ['owl', 'Plan', '안경 · 설계도'],
+  const cast = [['clawd', 'Claude', '방마다 작업 모자'], ['sprout', 'Explore', '탐험 모자 · 돋보기'], ['owl', 'Plan', '안경 · 설계도'],
     ['bunny', '범용', '파란 목도리'], ['chick', '그 밖의 에이전트', ''], ['human', '나', '']];
   $('#legend').innerHTML = rooms.map(k => `<li><span>${ROOMS[k].icon}</span><b>${ROOMS[k].name}</b><em>${ROOMS[k].desc}</em></li>`).join('') +
     cast.map(([sp, who, note]) => `<li class="cast"><img src="${portraitUrl(sp)}" alt=""><b>${SPECIES[sp].name}</b><em>${who}${note ? ' · ' + note : ''}</em></li>`).join('');

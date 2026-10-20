@@ -1,4 +1,4 @@
-// 마을 캐릭터 그리기. 모두 이 프로젝트를 위해 새로 디자인한 오리지널 캐릭터다.
+// 마을 캐릭터 그리기. 클로드봇은 Claude Code 마스코트를 본떴고, 나머지는 이 프로젝트를 위해 새로 디자인했다.
 // 각 함수는 발밑을 (0,0)으로 두고 위쪽(-y)으로 그리며, 오른쪽을 바라보는 3/4 정면 모습이다.
 import { shade, rgba } from './art.js';
 
@@ -109,34 +109,64 @@ function leaf(ctx, x, y, ang, len, wid, color, line) {
   ctx.restore();
 }
 
-// ---------------------------------------------------------------- 모찌 (Claude)
+// ---------------------------------------------------------------- 클로드봇 (Claude)
 
-// 코랄색 찹쌀떡. 머리 위에 여섯 갈래 별꽃 새싹이 났다.
-function mochi(ctx, o) {
-  const base = '#ef8b60', line = '#a14a2b';
-  const swing = o.step * 1.5;
-  feet(ctx, shade(base, -0.12), line, o.step, 6.5);
-  ell(ctx, -14.5, -11 + swing, 3.6, 3, soft(ctx, -14.5, -11, 4, base), line, 1.2, -0.5);
-  ell(ctx, 14.5, -11 - swing, 3.6, 3, soft(ctx, 14.5, -11, 4, base), line, 1.2, 0.5);
-  bodyPath(ctx, 0, -14.5, 15.5, 13.5);
-  paint(ctx, base, line, 0, -15, 16);
-  ell(ctx, 1, -8.5, 9.5, 5.2, 'rgba(255,243,230,.75)');
-  sheen(ctx, -7.5, -23, 4.2, 2.2);
-  // 별꽃 새싹
-  ctx.strokeStyle = '#6aa84f'; ctx.lineWidth = 1.6; ctx.lineCap = 'round';
-  ctx.beginPath(); ctx.moveTo(0.5, -27.5); ctx.quadraticCurveTo(0, -30, 1.5, -32.5); ctx.stroke();
-  const cx = 1.8, cy = -35.5;
-  for (let i = 0; i < 6; i++) {
-    const a = i / 6 * TAU + (o.t ? Math.sin(o.t * 2) * 0.08 : 0);
-    ell(ctx, cx + Math.cos(a) * 3.2, cy + Math.sin(a) * 3.2, 1.7, 3.3, soft(ctx, cx, cy, 5, '#f7a47c', 0.35), line, 1, a + Math.PI / 2);
+// Claude Code 터미널 마스코트의 기본 스프라이트를 그대로 옮겼다.
+//    ▐▛███▛█       반칸 블록 하나 = 픽셀 하나(가로 1 : 세로 2).
+//   ▝▜██████▀      몸통 13×4 픽셀, 둘째 줄 양끝에서 셋째 칸에 세로로 긴 눈 구멍,
+//    ▝▝   ▝▝       셋째 줄에서 양옆으로 두 칸 팔, 가운데가 빈 네 다리. 색은 rgb(215,119,87).
+// 마을의 다른 블록과 어울리도록 몸통에 윗면과 옆면을 붙여 입체로 그린다.
+const CLAWD_PW = 2.8, CLAWD_PH = 5.6;                      // 픽셀 하나의 가로·세로
+const clawdX = i => (i - 9.5) * CLAWD_PW;                        // 스프라이트 열 → x (몸통 열 3..15)
+const clawdY = j => -28 + j * CLAWD_PH;                          // 스프라이트 행 → y (몸통 행 0..3, 다리 행 4)
+
+function clawd(ctx, o) {
+  const base = '#d77757', line = '#a84f33', eyeCol = '#231c1e';
+  const dx = 3.4, dy = -2.4;                                 // 윗면·옆면 깊이
+  const x0 = clawdX(3), x1 = clawdX(16), y0 = clawdY(0), y1 = clawdY(4);
+  const poly = (pts, fill) => {
+    ctx.beginPath(); ctx.moveTo(pts[0], pts[1]);
+    for (let i = 2; i < pts.length; i += 2) ctx.lineTo(pts[i], pts[i + 1]);
+    ctx.closePath(); ctx.fillStyle = fill; ctx.fill();
+    ctx.strokeStyle = line; ctx.lineWidth = 1.1; ctx.lineJoin = 'round'; ctx.stroke();
+  };
+  const front = (ax, ay, bx, by) => {
+    const g = ctx.createLinearGradient(0, ay, 0, by);
+    g.addColorStop(0, shade(base, 0.16)); g.addColorStop(1, base);
+    poly([ax, ay, bx, ay, bx, by, ax, by], g);
+  };
+
+  // 다리 네 개 (열 3, 5, 13, 15). 걸을 땐 바깥 왼다리·안쪽 오른다리와 나머지 둘이 번갈아 들린다.
+  const liftA = Math.max(0, o.step) * 2.2, liftB = Math.max(0, -o.step) * 2.2;
+  for (const [col, lift] of [[3, liftA], [5, liftB], [13, liftA], [15, liftB]]) front(clawdX(col), y1 - 0.6, clawdX(col + 1), -lift);
+  // 팔 (셋째 줄, 양옆 두 칸). 몸통 깊이의 가운데에 붙어 있다.
+  const swing = o.step * 1, ax = dx * 0.5, ay = dy * 0.5;
+  front(clawdX(1) + ax, clawdY(2) + ay + swing, clawdX(3) + ax, clawdY(3) + ay + swing);
+  // 몸통: 옆면, 윗면, 앞면
+  poly([x1, y0, x1 + dx, y0 + dy, x1 + dx, y1 + dy, x1, y1], shade(base, -0.16));
+  poly([x0, y0, x1, y0, x1 + dx, y0 + dy, x0 + dx, y0 + dy], shade(base, 0.34));
+  front(x0, y0, x1, y1);
+  front(clawdX(16) + ax, clawdY(2) + ay - swing, clawdX(18) + ax, clawdY(3) + ay - swing);
+  ctx.strokeStyle = 'rgba(255,255,255,.38)'; ctx.lineWidth = 1; ctx.lineCap = 'round';
+  ctx.beginPath(); ctx.moveTo(x0 + 1.4, y0 + 1.2); ctx.lineTo(x1 - 1.6, y0 + 1.2); ctx.stroke();
+
+  // 눈: 기본은 세로로 긴 네모 구멍 (열 5·13, 둘째 줄). 걸을 땐 가는 쪽을 본다 (열 6·14, 첫째 줄).
+  ctx.fillStyle = eyeCol; ctx.strokeStyle = eyeCol;
+  if (o.eyes === 'closed' || o.blink) {
+    // 감은 눈: 눈 칸 아래쪽의 가는 눈꺼풀 선
+    for (const c of [4, 12]) ctx.fillRect(clawdX(c), clawdY(2) - CLAWD_PH * 0.42, CLAWD_PW * 2, CLAWD_PH * 0.42);
+  } else if (o.eyes === 'happy') {
+    // 기분 좋을 때만 쓰는 > < 눈 (원래 스프라이트에는 없는 표정)
+    ctx.lineWidth = 2.4; ctx.lineCap = 'butt'; ctx.lineJoin = 'miter';
+    const ey = clawdY(1) + CLAWD_PH * 0.2;
+    ctx.beginPath(); ctx.moveTo(clawdX(4.2), ey - 3.4); ctx.lineTo(clawdX(6.3), ey); ctx.lineTo(clawdX(4.2), ey + 3.4); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(clawdX(14.8), ey - 3.4); ctx.lineTo(clawdX(12.7), ey); ctx.lineTo(clawdX(14.8), ey + 3.4); ctx.stroke();
+  } else {
+    const look = o.step !== 0 ? 1 : 0;
+    for (const c of [5, 13]) ctx.fillRect(clawdX(c + look), clawdY(1 - look), CLAWD_PW, CLAWD_PH);
   }
-  ell(ctx, cx, cy, 1.9, 1.9, '#ffd36e', '#c9862a', 0.9);
-  const fx = 1.2;
-  eye(ctx, -4.4 + fx, -16.5, 2.4, 3, o);
-  eye(ctx, 5.4 + fx, -16.5, 2.4, 3, o);
-  cheeks(ctx, -8.8 + fx, 9.8 + fx, -11.8);
-  mouth(ctx, 0.5 + fx, -12.2, o.mouth || 'smile', 2.2);
-  return { top: -40, eyes: [[-4.4 + fx, -16.5], [5.4 + fx, -16.5]], head: { x: 0.5, y: -28, w: 14 } };
+  const eyeY = clawdY(1) + CLAWD_PH / 2;
+  return { top: y0 + dy - 0.5, eyes: [[clawdX(5.5), eyeY], [clawdX(13.5), eyeY]], head: { x: 1.2, y: y0 + dy * 0.5, w: 19 } };
 }
 
 // ---------------------------------------------------------------- 새싹이 (Explore)
@@ -363,7 +393,7 @@ function duck(ctx, o) {
 }
 
 export const SPECIES = {
-  mochi: { name: '모찌', draw: mochi, color: '#ef8b60', w: 1.1 },
+  clawd: { name: '클로드봇', draw: clawd, color: '#d77757', w: 1.45 },
   sprout: { name: '새싹이', draw: sprout, color: '#6cc04e' },
   owl: { name: '부엉이', draw: owl, color: '#8b6fd0' },
   bunny: { name: '토끼', draw: bunny, color: '#5aa9e6' },
@@ -512,7 +542,7 @@ const CHAR_SCALE = 1.4;
 
 // (ch.sx, ch.sy)는 발 위치. 말풍선을 붙일 머리 꼭대기 y를 돌려준다.
 export function drawCharacter(ctx, ch, t) {
-  const sp = SPECIES[ch.species] || SPECIES.mochi;
+  const sp = SPECIES[ch.species] || SPECIES.clawd;
   const seed = ch.seed || 0;
   const walking = ch.moving;
   const phase = t * 10 + seed;
@@ -567,7 +597,7 @@ export function portrait(species, size = 34) {
   c.style.width = c.style.height = size + 'px';
   const ctx = c.getContext('2d');
   ctx.scale(dpr, dpr);
-  const sp = SPECIES[species] || SPECIES.mochi;
+  const sp = SPECIES[species] || SPECIES.clawd;
   const k = size / 46;
   ctx.translate(size / 2, size * 0.94);
   ctx.scale(k, k);
