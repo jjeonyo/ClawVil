@@ -393,7 +393,7 @@ function duck(ctx, o) {
 }
 
 export const SPECIES = {
-  clawd: { name: '클로드봇', draw: clawd, color: '#d77757', w: 1.45 },
+  clawd: { name: '클로드봇', draw: clawd, color: '#d77757', w: 1.45, mark: 24 },   // mark: 경고 표지 x 위치 (눈을 가리지 않게)
   sprout: { name: '새싹이', draw: sprout, color: '#6cc04e' },
   owl: { name: '부엉이', draw: owl, color: '#8b6fd0' },
   bunny: { name: '토끼', draw: bunny, color: '#5aa9e6' },
@@ -624,7 +624,7 @@ export function drawCharacter(ctx, ch, t) {
   if (ch.emote === 'wave') hand(ctx, 17 * facing, headY + 12, t, sp.color);
   if (ch.eyes === 'happy') sparkles(ctx, 0, headY + 6, t);
   if (ch.sweat) sweat(ctx, -10 * facing, headY + 8, t);
-  if (alert) alertMark(ctx, alert, 15 * facing, top + 2, t);
+  if (alert) alertMark(ctx, alert, (sp.mark || 15) * facing, top + 2, t);
   if (ch.poofT != null) {
     const p = (t - ch.poofT) / 0.7;
     if (p >= 0 && p < 1) poof(ctx, p);

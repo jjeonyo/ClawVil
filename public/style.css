@@ -125,7 +125,7 @@ body {
   font-family: var(--round); font-size: 12px; border-radius: 12px; padding: 4px 10px; white-space: nowrap;
   border: 2px solid; animation: chipPulse 1.1s ease-in-out infinite;
 }
-#alerts .chip.err { background: linear-gradient(#ff6a6a, #e0353f); color: #fff; border-color: #8f1820; --glow: rgba(255, 59, 71, .55); }
+#alerts .chip.err { background: linear-gradient(#d42a35, #b51f2a); color: #fff; border-color: #6e0f16; --glow: rgba(255, 59, 71, .55); }
 #alerts .chip.warn { background: linear-gradient(#ffd84d, #ffb21a); color: #3d2600; border-color: #9a5a00; --glow: rgba(255, 178, 26, .6); }
 @keyframes chipPulse { 50% { box-shadow: 0 0 0 4px var(--glow); } }
 .live {
@@ -203,7 +203,7 @@ code { background: #f3e7cf; padding: 1px 6px; border-radius: 6px; font-size: .9e
 .pill.s-working { background: #dff3d4; color: #2f6b2b; }
 .pill.s-reporting { background: #dcefff; color: #22609a; }
 .pill.s-leaving, .pill.s-arriving { background: #f3e3ff; color: #6a3d9a; }
-.pill.a-error { background: #e0353f; color: #fff; font-weight: bold; }
+.pill.a-error { background: #c0262f; color: #fff; font-weight: bold; }
 .pill.a-attention { background: #ffc53d; color: #3d2600; font-weight: bold; }
 .person.alert-error { border-color: #ff8a8a; background: #fff3f3; box-shadow: inset 4px 0 0 #e0353f; }
 .person.alert-attention { border-color: #ffd36b; background: #fffaea; box-shadow: inset 4px 0 0 #ffb21a; }

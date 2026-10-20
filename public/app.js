@@ -281,6 +281,18 @@ class Town {
     const a = this.actorFor(ev);
     if (!a || a.gone) return;
     a.lastAt = now;
+    if (a === this.claude && (ev.k === 'think' || ev.k === 'text' || ev.k === 'tool')) {
+      // Claude는 도구 결과를 모두 받아야 다음 응답을 시작한다. 그런데도 남아 있는 이전 응답의 도구는
+      // 결과 줄이 빠진 것(4MB 넘는 줄 등)이니 끝난 것으로 정리한다. 서브에이전트 호출은 따로 끝을 판단한다.
+      // 응답 ID(mid)가 있으면 그것으로, 없으면 '도구 결과가 온 뒤 처음 나온 기록'으로 새 응답을 가린다
+      for (const [id, p] of this.pending) {
+        if (p.agent !== a || p.ev.name === 'Task' || p.ev.name === 'Agent') continue;
+        if (!(p.ev.mid && ev.mid ? p.ev.mid !== ev.mid : this.claudeStepDone)) continue;
+        this.pending.delete(id);
+        a.unsay(b => b.tool === id);
+      }
+      this.claudeStepDone = false;
+    }
     if (a.kind === 'sub' && (a.state === 'reporting' || a.state === 'leaving') && (ev.k === 'tool' || ev.k === 'think')) {
       // 보고하러 가다가 일을 하나 더 받으면 다시 일하러 돌아간다. 이때는 끝났다는 신호(Task 결과)가 다시 오지 않으므로
       // 기록이 한동안 멈추면 알아서 다시 보고하러 간다 (updateSubs)
@@ -366,6 +378,7 @@ class Town {
     if (!p) return;
     this.pending.delete(ev.id);
     const a = p.agent;
+    if (a === this.claude) this.claudeStepDone = true;
     a.unsay(b => b.until === Infinity && b.tool === ev.id);
     if (a.emote === 'read' || a.emote === 'phone') a.emote = null;
     if (ev.err) {
@@ -417,7 +430,8 @@ class Town {
   finishSub(a, ev) {
     for (const [id, p] of this.pending) if (p.agent === a) this.pending.delete(id);
     if (this.replaying) { this.removeSub(a); return; }
-    a.state = 'reporting'; a.activity = '보고하러 가는 중'; a.emote = null; a.unsay();
+    a.state = 'reporting'; a.activity = '보고하러 가는 중'; a.emote = null;
+    a.unsay(b => !(b.type === 'err' && Date.now() - b.born < ERR_HOLD_MS));   // 막 뜬 오류 말풍선은 남긴다
     const spot = this.spotNearClaude(a);
     this.release(a);
     a.spot = spot; this.reserved.set(spot, a); a.room = 'report';
@@ -458,6 +472,7 @@ class Town {
 
   endTurn(msg, t, quiet = false) {
     this.turnActive = false;
+    this.claudeStepDone = false;
     for (const [id, p] of this.pending) if (p.agent === this.claude) this.pending.delete(id);
     const c = this.claude;
     c.state = 'idle'; c.activity = '대기 중'; c.emote = null; c.mouth = null; c.since = Date.now();

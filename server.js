@@ -164,12 +164,14 @@ function compact(rec, src) {
       const m = rec.message || {};
       if (rec.isApiErrorMessage) { out.push({ ...base, k: 'apierr', text: clip(resultText(m.content), 160) }); break; }
       if (!Array.isArray(m.content)) break;
+      // mid: 한 번의 API 응답에서 나온 기록끼리 같은 값. 화면에서 Claude의 단계 경계를 가르는 데 쓴다
+      const ab = m.id ? { ...base, mid: m.id } : base;
       for (const b of m.content) {
         if (!b) continue;
-        if (b.type === 'thinking') out.push({ ...base, k: 'think', text: clip(b.thinking || '', 280) });
-        else if (b.type === 'redacted_thinking') out.push({ ...base, k: 'think', text: '' });
-        else if (b.type === 'text' && b.text && b.text.trim()) out.push({ ...base, k: 'text', text: clip(b.text, 400), stop: m.stop_reason || null });
-        else if (b.type === 'tool_use') out.push({ ...base, k: 'tool', id: b.id, name: b.name, input: compactInput(b.name, b.input) });
+        if (b.type === 'thinking') out.push({ ...ab, k: 'think', text: clip(b.thinking || '', 280) });
+        else if (b.type === 'redacted_thinking') out.push({ ...ab, k: 'think', text: '' });
+        else if (b.type === 'text' && b.text && b.text.trim()) out.push({ ...ab, k: 'text', text: clip(b.text, 400), stop: m.stop_reason || null });
+        else if (b.type === 'tool_use') out.push({ ...ab, k: 'tool', id: b.id, name: b.name, input: compactInput(b.name, b.input) });
       }
       break;
     }
