@@ -4,6 +4,11 @@
 # 리뷰, 요약, 채팅을 한국어로
 language: ko-KR
 
+reviews:
+  auto_review:
+    # 초안(draft) PR도 자동으로 리뷰
+    drafts: true
+
 code_generation:
   docstrings:
     # 자동 생성 docstring도 한국어로
