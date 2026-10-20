@@ -35,8 +35,8 @@
 Node.js 18 이상과 최신 브라우저(Chrome, Edge, Firefox, Safari)만 있으면 된다. 설치할 패키지는 없다.
 
 ```bash
-git clone https://github.com/jjeonyo/PokeAI.git
-cd PokeAI
+git clone https://github.com/jjeonyo/ClawVil.git
+cd ClawVil
 node server.js          # 브라우저에서 http://localhost:4848 열기
 ```
 
