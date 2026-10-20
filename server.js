@@ -150,7 +150,8 @@ function compact(rec, src) {
         for (const b of c) {
           if (!b || b.type !== 'tool_result') continue;
           out.push({ ...base, k: 'result', id: b.tool_use_id, err: !!b.is_error,
-            text: clip(resultText(b.content), 240), agent: tur && tur.agentId ? String(tur.agentId) : undefined });
+            text: clip(resultText(b.content), 240), agent: tur && tur.agentId ? String(tur.agentId) : undefined,
+            async: !!(tur && (tur.isAsync || tur.status === 'async_launched')) });
         }
       }
       const p = cleanPrompt(userText(c));

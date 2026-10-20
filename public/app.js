@@ -233,7 +233,7 @@ class Town {
       // Task 호출이 읽은 범위 밖에 있었던 경우: 기록만 보고 데려온다. 호출 결과는 agentId로 찾아 잇고,
       // 그마저 없으면 다시 일하러 간 서브에이전트처럼 한동안 조용할 때 보고하러 간다 (updateSubs)
       a = this.spawnSub({ id: 'file:' + key, t: ev && ev.t, input: { subagent_type: meta.agentType || '', description: short(meta.prompt, 20), prompt: meta.prompt } }, true);
-      a.resumed = true;
+      if (!meta.agentId) a.resumed = true;
     }
     if (meta.agentId) a.agentId = meta.agentId;
     a.fileKey = key;
@@ -323,7 +323,13 @@ class Town {
     const p = this.pending.get(ev.id);
     const sub = this.subs.get(ev.id)
       || (ev.agent ? [...this.subs.values()].find(s => s.agentId === ev.agent && !s.gone && s.state !== 'reporting' && s.state !== 'leaving') : null);
-    if (sub && !sub.gone) { sub.resumed = false; this.finishSub(sub, ev); }
+    if (sub && !sub.gone) {
+      if (ev.async) {
+        // 백그라운드 서브에이전트: 호출 결과는 시작할 때 바로 온다. 끝은 기록이 멈추는 것으로 판단한다.
+        sub.resumed = true;
+        this.log(sub, '🌙 백그라운드에서 일하는 중');
+      } else { sub.resumed = false; this.finishSub(sub, ev); }
+    }
     if (!p) return;
     this.pending.delete(ev.id);
     const a = p.agent;
@@ -823,7 +829,9 @@ $('#floors').addEventListener('click', e => {
   if (t.dataset.more) { app.showAllSessions = !app.showAllSessions; return renderFloors(); }
   if (t.dataset.follow) {
     app.autoFollow = !app.autoFollow;
-    if (app.autoFollow && app.floor.sessions[0] && app.floor.sessions[0].id !== app.session) openSession(app.floor, app.floor.sessions[0].id);
+    const newest = newestStarted(app.floor);
+    if (app.autoFollow && newest && newest !== app.session) openSession(app.floor, newest);
+    else history.replaceState(null, '', `#floor=${encodeURIComponent(app.floor.id)}${app.autoFollow ? '' : '&session=' + encodeURIComponent(app.session)}`);
     return renderFloors();
   }
   if (t.dataset.session) {
