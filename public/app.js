@@ -76,9 +76,9 @@ function describeTool(name, i = {}) {
   }
 }
 
-const RESUMED_QUIET_MS = 30000;
+const RESUMED_QUIET_MS = 30000;   // 다시 일하러 간 서브에이전트가 이만큼 조용하면 끝난 것으로 본다
 // Claude Code는 명령이 도는 동안 기록을 쓰지 않는다. 끝나지 않은 도구가 있으면 이 시간까지는 일하는 중으로 본다.
-const WAIT_MS = 30 * 60e3;   // 다시 일하러 간 서브에이전트가 이만큼 조용하면 끝난 것으로 본다
+const WAIT_MS = 30 * 60e3;
 
 const CLAUDE_PROPS = { library: 'glasses', dev: 'hardhat', server: 'headset', info: 'antenna', meeting: 'beret' };
 
@@ -519,7 +519,9 @@ class Town {
     for (const a of this.subs.values()) {
       if (!a.resumed || a.gone || a.state !== 'working' || a.moving) continue;
       const busy = [...this.pending.values()].some(p => p.agent === a);
-      if (!busy && (now - a.lastAt > RESUMED_QUIET_MS || !live)) { a.resumed = false; this.finishSub(a, { text: '', err: false }); }
+      const quiet = now - a.lastAt;
+      // 끝나지 않은 도구가 있어도 결과가 끝내 안 오면(4MB 넘는 줄, 도중에 끈 경우) WAIT_MS 뒤에는 끝난 것으로 본다
+      if (busy ? quiet > WAIT_MS : (quiet > RESUMED_QUIET_MS || !live)) { a.resumed = false; this.finishSub(a, { text: '', err: false }); }
     }
   }
 
