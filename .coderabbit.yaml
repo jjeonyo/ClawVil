@@ -1,0 +1,10 @@
+# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
+# CodeRabbit 설정 — https://docs.coderabbit.ai/reference/configuration
+
+# 리뷰, 요약, 채팅을 한국어로
+language: ko-KR
+
+code_generation:
+  docstrings:
+    # 자동 생성 docstring도 한국어로
+    language: ko-KR
