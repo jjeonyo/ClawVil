@@ -98,15 +98,17 @@ class Agent {
   }
   get moving() { return this.path.length > 0; }
   get sweat() { return Date.now() < this.sweatUntil; }
-  // 눈에 띄게 표시할 상태: 'error'(실패·오류) · 'attention'(질문·승인 대기) · null
+  // 눈에 띄게 표시할 상태: 'attention'(질문·승인 대기) · 'error'(실패·오류) · null
+  // 진땀이 남아 있어도 질문·승인 대기 말풍선이 떠 있으면 내가 할 일이 있으니 확인 필요로 본다
   get alert() {
     const t = this.bubble && this.bubble.type;
-    if (this.sweat || t === 'err') return 'error';
-    return t === 'ask' || t === 'wait' ? 'attention' : null;
+    if (t === 'ask' || t === 'wait') return 'attention';
+    return this.sweat || t === 'err' ? 'error' : null;
   }
-  say(type, text, ms = 3500) {
+  // tool: 이 말풍선을 띄운 도구 호출 ID. 그 도구가 끝날 때 지운다
+  say(type, text, ms = 3500, tool = null) {
     const now = Date.now();
-    const b = { type, text, born: now, until: ms ? now + ms : Infinity };
+    const b = { type, text, tool, born: now, until: ms ? now + ms : Infinity };
     // 막 뜬 오류 말풍선은 평범한 말풍선에 바로 가리지 않는다. 그 말풍선은 update()에서 뒤이어 띄운다
     const cur = this.bubble;
     if (cur && cur.type === 'err' && !ALERT_BUBBLES.has(type) && now - cur.born < ERR_HOLD_MS) { this.queued = b; return; }
@@ -187,6 +189,16 @@ class Town {
     if (this.replaying) { this.place(a, spot); a.onArrive(); return; }
     a.path = findPath(this.world, a, spot);
     a.target = spot;
+  }
+
+  // 화면을 그리지 않는 동안에는 걷는 모습을 건너뛰고 바로 도착시킨다
+  settle() {
+    for (const a of [...this.chars]) {
+      if (!a.path.length) continue;
+      const end = a.path[a.path.length - 1];
+      a.x = end.x; a.y = end.y; a.path = [];
+      if (a.onArrive) a.onArrive();
+    }
   }
 
   goRoom(a, room, onArrive) {
@@ -332,11 +344,11 @@ class Town {
     }
     if (room === 'ask') {
       this.goRoom(a, 'ask', () => { a.facing = -1; });
-      a.say('ask', ev.input.question || '확인할 게 있어요', 0);
+      a.say('ask', ev.input.question || '확인할 게 있어요', 0, ev.id);
       return;
     }
     if (todosOf(ev)) { this.world.todos = todosOf(ev); }
-    a.say('say', what, 0);
+    a.say('say', what, 0, ev.id);
     this.goRoom(a, room, () => { if (room === 'library') a.emote = 'read'; });
   }
 
@@ -354,7 +366,7 @@ class Town {
     if (!p) return;
     this.pending.delete(ev.id);
     const a = p.agent;
-    a.unsay(b => ['say', 'ask', 'wait'].includes(b.type) && b.until === Infinity);
+    a.unsay(b => b.until === Infinity && b.tool === ev.id);
     if (a.emote === 'read' || a.emote === 'phone') a.emote = null;
     if (ev.err) {
       a.sweatUntil = Date.now() + 4500;
@@ -478,9 +490,9 @@ class Town {
       this.place(this.claude, this.world.claudeSeat);
     } else {
       // 진행 중인 도구가 있으면 그 말풍선을 다시 띄운다
-      for (const p of this.pending.values()) {
-        if (p.ev.name === 'AskUserQuestion') p.agent.say('ask', p.ev.input.question || '확인할 게 있어요', 0);
-        else if (!['Task', 'Agent'].includes(p.ev.name)) p.agent.say('say', describeTool(p.ev.name, p.ev.input), 0);
+      for (const [id, p] of this.pending) {
+        if (p.ev.name === 'AskUserQuestion') p.agent.say('ask', p.ev.input.question || '확인할 게 있어요', 0, id);
+        else if (!['Task', 'Agent'].includes(p.ev.name)) p.agent.say('say', describeTool(p.ev.name, p.ev.input), 0, id);
       }
     }
     this.claude.since = this.lastEventAt || Date.now();
@@ -530,14 +542,19 @@ class Town {
         c.emote = 'ponder';
         if (!c.bubble) c.say('think', `고민 중… ${Math.round(quiet / 1000)}초째`, 1200);
       }
-      for (const p of this.pending.values()) {
-        if (p.agent !== c || LONG_TOOLS.has(p.ev.name) || /^mcp__/.test(p.ev.name) || p.asked) continue;
-        if (now - p.at > 7000 && live) {
-          p.asked = true;
-          c.say('wait', '승인 기다리는 중일까요?', 0);
-          this.log(c, `⏳ 승인 대기 중인 것 같아요: ${p.ev.name}`, { warn: true });
-        }
+      // 승인을 기다리는 것으로 보이는 도구가 남아 있는 동안 ⏳ 말풍선을 띄운다 (로그는 도구마다 한 번)
+      let waitFor = null;
+      for (const [id, p] of this.pending) {
+        if (p.agent !== c || LONG_TOOLS.has(p.ev.name) || /^mcp__/.test(p.ev.name) || !live || now - p.at <= 7000) continue;
+        waitFor = id;
+        if (!p.asked) { p.asked = true; this.log(c, `⏳ 승인 대기 중인 것 같아요: ${p.ev.name}`, { warn: true }); }
       }
+      if (waitFor && !(c.bubble && ALERT_BUBBLES.has(c.bubble.type))) c.say('wait', '승인 기다리는 중일까요?', 0, waitFor);
+    }
+    // 답을 기다리는 질문이 있으면, 함께 호출한 도구의 말풍선에 덮였더라도 ? 말풍선을 다시 띄운다
+    for (const [id, p] of this.pending) {
+      const a = p.agent;
+      if (p.ev.name === 'AskUserQuestion' && !(a.bubble && ALERT_BUBBLES.has(a.bubble.type))) a.say('ask', p.ev.input.question || '확인할 게 있어요', 0, id);
     }
     if (c.state === 'idle' && !c.moving) c.emote = now - c.since > 3 * 60e3 ? 'sleep' : (c.emote === 'sleep' ? null : c.emote);
     if (c.emote === 'phone' && now > this.phoneUntil) c.emote = null;
@@ -981,4 +998,11 @@ renderLegend();
 refreshFloors();
 setInterval(refreshFloors, FLOORS_MS);
 setInterval(() => renderFloors(), 15000);
+// 다른 탭을 보는 동안에는 화면을 그리지 않으니(requestAnimationFrame 멈춤) 상태와 탭 제목만 따로 갱신한다
+setInterval(() => {
+  if (!document.hidden || !app.town) return;
+  app.town.settle();
+  app.town.update(0, app.sessionActive);
+  renderAlerts();
+}, 1000);
 requestAnimationFrame(frame);
