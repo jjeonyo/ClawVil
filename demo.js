@@ -163,7 +163,7 @@ async function sideScenario(root) {
 }
 
 function start() {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'pokeai-demo-'));
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'mochi-village-demo-'));
   seedOldFloors(root);
   mainScenario(root).catch(e => console.error('demo:', e));
   setTimeout(() => sideScenario(root).catch(e => console.error('demo:', e)), 300);

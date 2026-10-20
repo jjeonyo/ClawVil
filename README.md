@@ -1,11 +1,11 @@
-# PokeAI
+# 모찌마을 (Mochi Village)
 Show currently working AI
 
 Claude Code가 터미널에서 무엇을 하는지 아기자기한 블록 마을로 보여준다.
 Claude(모찌)는 파일을 읽을 땐 자료실로, 명령을 돌릴 땐 서버실로 걸어가고,
 일을 나눠 맡기면 서브에이전트 친구들이 엘리베이터를 타고 출근한다.
 
-![PokeAI 마을](docs/screenshot.png)
+![모찌마을](docs/screenshot.png)
 
 ## 실행
 
