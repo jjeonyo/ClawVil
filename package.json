@@ -1,0 +1,14 @@
+{
+  "name": "pokeai",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Claude Code 세션을 포코피아풍 블록 마을로 보여주는 로컬 뷰어",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "demo": "node server.js --demo"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
