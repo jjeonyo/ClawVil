@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// PokeAI — Claude Code 세션 기록(jsonl)을 따라 읽어 포코피아풍 마을로 보여주는 로컬 서버.
+// PokeAI — Claude Code 세션 기록(jsonl)을 따라 읽어 블록 마을로 보여주는 로컬 서버.
 // 외부 패키지 없음. 훅/설정을 건드리지 않고 ~/.claude/projects 아래 파일을 읽기만 한다.
 'use strict';
 

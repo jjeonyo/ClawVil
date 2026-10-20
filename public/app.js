@@ -1,6 +1,6 @@
 // 세션 기록을 받아 캐릭터를 움직이고, 층 안내·사람 목록·활동 로그를 그린다.
 import { buildWorld, findPath, render, iso, GW, GH, ROOMS, THEMES, themeForFloor } from './world.js';
-import { SPECIES, speciesForAgent } from './pokemon.js';
+import { SPECIES, speciesForAgent, portrait } from './critters.js';
 
 const POLL_MS = 250;
 const FLOORS_MS = 2000;
@@ -76,6 +76,8 @@ function describeTool(name, i = {}) {
   }
 }
 
+const CLAUDE_PROPS = { library: 'glasses', dev: 'hardhat', server: 'headset', info: 'antenna', meeting: 'beret' };
+
 const LONG_TOOLS = new Set(['Bash', 'BashOutput', 'Monitor', 'Task', 'Agent', 'WebFetch', 'WebSearch', 'AskUserQuestion', 'SendMessage']);
 
 // ---------------------------------------------------------------- 캐릭터
@@ -115,10 +117,23 @@ class Town {
     this.userTypingUntil = 0;
     this.dirty = true;
 
-    this.user = this.add(new Agent({ id: 'user', kind: 'user', species: 'trainer', label: opts.userName + ' (나)', color: '#e8483f', speed: 2.5 }));
+    this.user = this.add(new Agent({ id: 'user', kind: 'user', species: 'human', label: opts.userName + ' (나)', color: SPECIES.human.color, speed: 2.5 }));
     this.place(this.user, world.userSeat);
-    this.claude = this.add(new Agent({ id: 'claude', kind: 'claude', species: 'ditto', label: 'Claude', color: CLAUDE_COLOR }));
+    this.claude = this.add(new Agent({ id: 'claude', kind: 'claude', species: 'mochi', label: 'Claude', color: CLAUDE_COLOR }));
     this.place(this.claude, world.claudeSeat);
+
+    // 마을 주민: 쉼터에서 자는 양, 연못가를 뛰어다니는 개구리, 헤엄치는 오리
+    const sheep = this.add(new Agent({ id: 'sheep', kind: 'npc', species: 'sheep', label: '' }));
+    this.place(sheep, world.napSpot);
+    sheep.emote = 'sleep';
+    if (world.frogSpots.length) {
+      this.frog = this.add(new Agent({ id: 'frog', kind: 'npc', species: 'frog', label: '', speed: 1.6 }));
+      this.place(this.frog, world.frogSpots[0]);
+      this.frog.nextHop = performance.now() + 4000;
+    }
+    this.duck = this.add(new Agent({ id: 'duck', kind: 'npc', species: 'duck', label: '', speed: 0.45 }));
+    this.duck.loopIndex = 0;
+    this.place(this.duck, world.duckLoop[0]);
   }
 
   add(a) { this.chars.push(a); return a; }
@@ -228,7 +243,7 @@ class Town {
     a.lastAt = now;
     if (a.kind === 'sub' && (a.state === 'reporting' || a.state === 'leaving') && (ev.k === 'tool' || ev.k === 'think')) {
       // 보고하러 가다가 일을 하나 더 받으면 다시 일하러 돌아간다
-      a.state = 'working'; a.alpha = 1; a.emote = null;
+      a.state = 'working'; a.alpha = 1; a.emote = null; a.eyes = null; a.mouth = null;
       this.log(a, '↩️ 일이 더 생겨서 돌아가요', { t: ev.t });
     }
 
@@ -324,7 +339,6 @@ class Town {
     const a = this.add(new Agent({
       id: ev.id, kind: 'sub', type, species, color: SPECIES[species].color,
       label: short(type, 16), desc: i.description || '', prompt: i.prompt || '',
-      glasses: /plan/i.test(type), hat: /explore/i.test(type),
       activity: '출근 중', state: 'arriving', speed: 3.2, since: ev.t || Date.now(),
     }));
     this.subs.set(ev.id, a);
@@ -340,10 +354,12 @@ class Town {
       this.elevatorUntil = Date.now() + 1800;
       this.place(a, this.world.elevatorDoor);
       a.hidden = false; a.alpha = 0;
+      a.poofT = performance.now() / 1000; a.eyes = 'happy';
       a.say('say', '안녕하세요! 출근했어요', 2200);
       this.log(a, `🛗 출근 · ${a.desc}`);
       this.later(450, null, () => {
         a.alpha = 1;
+        this.later(1400, null, () => { if (a.eyes === 'happy') a.eyes = null; });
         if (a.state === 'arriving') { a.state = 'working'; a.activity = '일하러 가는 중'; this.goRoom(a, room, () => { if (room === 'library') a.emote = 'read'; }); }
       });
     });
@@ -361,18 +377,20 @@ class Town {
       if (a.state !== 'reporting') return;
       a.facing = a.x < this.claude.x ? 1 : -1;
       a.say(ev.err ? 'err' : 'report', (ev.err ? '죄송해요… ' : '보고: ') + (ev.text || '다 했어요!'), 3200);
+      if (!ev.err) a.eyes = 'happy'; else a.mouth = 'worried';
       this.log(a, (ev.err ? '😓 ' : '📋 ') + 'Claude에게 보고', { err: ev.err });
       this.later(3200, a, () => {
         if (a.state !== 'reporting') return;
         a.say('say', '👋 퇴근합니다!', 2000); a.emote = 'wave';
         this.later(1600, a, () => {
           if (a.state !== 'reporting') return;
-          a.state = 'leaving'; a.activity = '퇴근 중'; a.emote = null;
+          a.state = 'leaving'; a.activity = '퇴근 중'; a.emote = null; a.eyes = null; a.mouth = null;
           this.release(a);
           this.walk(a, this.world.elevatorDoor, () => {
             if (a.state !== 'leaving') return;
             this.elevatorUntil = Date.now() + 1500;
             this.log(a, '🛗 퇴근');
+            a.poofT = performance.now() / 1000;
             this.later(350, a, () => { a.alpha = 0.4; });
             this.later(700, a, () => this.removeSub(a));
           });
@@ -461,7 +479,28 @@ class Town {
     }
     if (c.state === 'idle' && !c.moving) c.emote = now - c.since > 3 * 60e3 ? 'sleep' : (c.emote === 'sleep' ? null : c.emote);
     if (c.emote === 'phone' && now > this.phoneUntil) c.emote = null;
+    // 방마다 쓰는 작업 소품
+    c.prop = c.arrived && c.state === 'working' ? (CLAUDE_PROPS[c.room] || null) : null;
+    this.updateNpcs(pnow);
     this.world.elevatorOpen += ((now < this.elevatorUntil ? 1 : 0) - this.world.elevatorOpen) * Math.min(1, dt * 6);
+  }
+
+  updateNpcs(pnow) {
+    const f = this.frog;
+    if (f && !f.moving && pnow > f.nextHop) {
+      const spots = this.world.frogSpots;
+      const near = spots.filter(s => Math.hypot(s.x - f.x, s.y - f.y) < 3.5 && (s.x !== f.x || s.y !== f.y));
+      const to = (near.length ? near : spots)[Math.floor(Math.random() * (near.length || spots.length))];
+      f.path = [to];
+      f.onArrive = () => { f.facing = Math.random() < 0.5 ? 1 : -1; };
+      f.nextHop = pnow + 5000 + Math.random() * 7000;
+    }
+    const d = this.duck;
+    if (d && !d.moving) {
+      d.loopIndex = (d.loopIndex + 1) % this.world.duckLoop.length;
+      d.path = [this.world.duckLoop[d.loopIndex]];
+      d.onArrive = null;
+    }
   }
 
   liveFlags(floorLabel, userName) {
@@ -736,11 +775,18 @@ $('#floors').addEventListener('click', e => {
 
 const STATE_LABEL = { working: '작업 중', idle: '대기', arriving: '출근 중', reporting: '보고 중', leaving: '퇴근 중' };
 
+// 패널에 쓰는 캐릭터 얼굴 그림 (한 번 그려 두고 재사용)
+const portraits = new Map();
+function portraitUrl(species) {
+  if (!portraits.has(species)) portraits.set(species, portrait(species, 40).toDataURL());
+  return portraits.get(species);
+}
+
 function renderPeople() {
   const town = app.town;
   if (!town) return;
   const now = Date.now();
-  const people = town.chars.filter(c => c.kind !== 'user' && !c.hidden || c.kind === 'sub');
+  const people = town.chars.filter(c => c.kind === 'claude' || c.kind === 'sub');
   $('#peopleCount').textContent = `${people.length}명 근무 중`;
   $('#people').innerHTML = people.map(a => {
     let st = STATE_LABEL[a.state] || a.state;
@@ -749,7 +795,7 @@ function renderPeople() {
     if (a.sweat) st = '진땀';
     const sp = SPECIES[a.species];
     return `<li class="person">
-      <span class="avatar" style="background:${a.color}">${a.kind === 'claude' ? 'C' : esc((a.type || '?')[0].toUpperCase())}</span>
+      <span class="avatar" style="border-color:${a.color}"><img src="${portraitUrl(a.species)}" alt=""></span>
       <div class="pbody">
         <div class="prow"><b>${esc(a.kind === 'claude' ? 'Claude' : a.type)}</b><span class="species">${esc(sp ? sp.name : '')}</span><span class="pill s-${esc(a.state)} ${a.sweat ? 'err' : ''}">${esc(st)}</span></div>
         ${a.desc ? `<div class="pdesc">${esc(a.desc)}</div>` : ''}
@@ -770,12 +816,10 @@ function renderLogs() {
 
 function renderLegend() {
   const rooms = ['library', 'dev', 'server', 'info', 'meeting', 'lobby', 'elevator'];
+  const cast = [['mochi', 'Claude', '방마다 작업 모자'], ['sprout', 'Explore', '탐험 모자 · 돋보기'], ['owl', 'Plan', '안경 · 설계도'],
+    ['bunny', '범용', '파란 목도리'], ['chick', '그 밖의 에이전트', ''], ['human', '나', '']];
   $('#legend').innerHTML = rooms.map(k => `<li><span>${ROOMS[k].icon}</span><b>${ROOMS[k].name}</b><em>${ROOMS[k].desc}</em></li>`).join('') +
-    `<li class="cast"><span>🟣</span><b>메타몽</b><em>Claude</em></li>
-     <li class="cast"><span>🌱</span><b>이상해씨</b><em>Explore · 모자</em></li>
-     <li class="cast"><span>👻</span><b>팬텀</b><em>Plan · 안경</em></li>
-     <li class="cast"><span>⚡</span><b>피카츄</b><em>범용 에이전트</em></li>
-     <li class="cast"><span>🦊</span><b>이브이</b><em>그 밖의 에이전트</em></li>`;
+    cast.map(([sp, who, note]) => `<li class="cast"><img src="${portraitUrl(sp)}" alt=""><b>${SPECIES[sp].name}</b><em>${who}${note ? ' · ' + note : ''}</em></li>`).join('');
 }
 
 let toastTimer = null;
