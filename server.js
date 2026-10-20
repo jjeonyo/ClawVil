@@ -11,6 +11,8 @@ const os = require('os');
 const args = parseArgs(process.argv.slice(2));
 const PORT = Number(args.port || process.env.PORT || 4848);
 const HOST = args.host || '127.0.0.1';
+// Host 헤더에서는 IPv6 주소가 [::1] 처럼 대괄호로 싸여 온다
+const HOST_HEADER = HOST.includes(':') && !HOST.startsWith('[') ? `[${HOST}]` : HOST;
 const PUBLIC_DIR = path.join(__dirname, 'public');
 
 let ROOT = args.dir || process.env.CLAUDE_PROJECTS_DIR ||
@@ -20,6 +22,7 @@ if (args.demo) ROOT = require('./demo').start();
 const ACTIVE_MS = 2 * 60 * 1000;       // 마지막 기록 후 이 시간 안이면 "불 켜진" 세션
 const INITIAL_TAIL = 2 * 1024 * 1024;      // 처음 열 때 메인 세션 끝부분만 읽는다
 const SUB_INITIAL_TAIL = 128 * 1024;
+const SUB_RECENT_MS = 30 * 60 * 1000;  // 처음 열 때 이 시간 안에 쓰인 서브에이전트 기록만 읽는다
 const MAX_CHUNK = 4 * 1024 * 1024;     // 한 번의 폴링에서 읽는 최대 바이트
 const HEAD_BYTES = 64 * 1024;
 const NAME_RE = /^[A-Za-z0-9._-]+$/;
@@ -377,8 +380,9 @@ function sessionDelta(floorId, sessionId, cursor) {
     let tail = null;
     if (typeof off !== 'number') {
       if (initial) {
-        // 처음 열 때: 끝난 지 오래된 서브에이전트는 건너뛰고, 최근 것만 끝부분을 읽는다
-        if (now - st.mtimeMs > 60 * 1000) off = st.size; else { off = null; tail = SUB_INITIAL_TAIL; }
+        // 처음 열 때: 끝난 지 오래된 서브에이전트는 건너뛰고, 최근 것만 끝부분을 읽는다.
+        // 긴 명령을 기다리는 동안에는 기록이 멈추므로 넉넉하게 30분까지 본다.
+        if (now - st.mtimeMs > SUB_RECENT_MS) off = st.size; else { off = null; tail = SUB_INITIAL_TAIL; }
       } else off = 0; // 새로 생긴 서브에이전트
     }
     const r = readNew(sub.file, off, tail);
@@ -423,7 +427,7 @@ const server = http.createServer((req, res) => {
   // 다른 사이트가 이 서버를 읽어 가지 못하도록 Host 헤더를 확인한다 (DNS 리바인딩 방지)
   const rawHost = req.headers.host || '';
   const host = rawHost.startsWith('[') ? rawHost.slice(0, rawHost.indexOf(']') + 1) : rawHost.split(':')[0];
-  if (!['localhost', '127.0.0.1', '[::1]', HOST].includes(host)) { res.writeHead(403); return res.end(); }
+  if (!['localhost', '127.0.0.1', '[::1]', HOST_HEADER].includes(host)) { res.writeHead(403); return res.end(); }
   try {
     if (url.pathname === '/api/floors') {
       return sendJson(res, 200, { root: ROOT, user: userName(), demo: !!args.demo, now: Date.now(), floors: listFloors() });
@@ -443,6 +447,15 @@ const server = http.createServer((req, res) => {
   } catch (e) {
     return sendJson(res, 500, { error: String(e && e.message || e) });
   }
+});
+
+server.on('error', e => {
+  const why = { EADDRINUSE: `포트 ${PORT}을 이미 다른 프로그램이 쓰고 있어요. --port 로 다른 포트를 주세요.`,
+    EADDRNOTAVAIL: `이 PC에 ${HOST} 주소가 없어요. --host 값을 확인하세요.`,
+    EAFNOSUPPORT: `이 PC에서 ${HOST} 주소 형식을 쓸 수 없어요 (IPv6가 꺼져 있을 수 있어요).`,
+    EACCES: `포트 ${PORT}을 열 권한이 없어요. 1024 이상의 포트를 쓰세요.` }[e.code];
+  console.error(`\n  서버를 열지 못했어요: ${why || e.message}\n`);
+  process.exit(1);
 });
 
 server.listen(PORT, HOST, () => {

@@ -76,7 +76,9 @@ function describeTool(name, i = {}) {
   }
 }
 
-const RESUMED_QUIET_MS = 30000;   // 다시 일하러 간 서브에이전트가 이만큼 조용하면 끝난 것으로 본다
+const RESUMED_QUIET_MS = 30000;
+// Claude Code는 명령이 도는 동안 기록을 쓰지 않는다. 끝나지 않은 도구가 있으면 이 시간까지는 일하는 중으로 본다.
+const WAIT_MS = 30 * 60e3;   // 다시 일하러 간 서브에이전트가 이만큼 조용하면 끝난 것으로 본다
 
 const CLAUDE_PROPS = { library: 'glasses', dev: 'hardhat', server: 'headset', info: 'antenna', meeting: 'beret' };
 
@@ -441,7 +443,7 @@ class Town {
     this.replaying = false;
     for (const ch of this.chars) ch.bubble = null;
     const quietFor = Date.now() - (this.lastEventAt || 0);
-    if (!sessionActive || quietFor > 10 * 60e3) {
+    if (!((sessionActive && quietFor <= 10 * 60e3) || this.waiting())) {
       for (const a of [...this.subs.values()]) this.removeSub(a);
       this.pending.clear();
       if (this.turnActive || this.claude.state !== 'idle') this.endTurn(null, undefined, true);
@@ -455,6 +457,11 @@ class Town {
     }
     this.claude.since = this.lastEventAt || Date.now();
     this.dirty = true;
+  }
+
+  // 기록은 멈췄지만 끝나지 않은 도구(긴 명령, 서브에이전트 호출 등)를 기다리는 중인가
+  waiting() {
+    return this.turnActive && this.pending.size > 0 && Date.now() - (this.lastEventAt || 0) < WAIT_MS;
   }
 
   // -------- 매 프레임
@@ -661,12 +668,16 @@ async function refreshFloors() {
   }
 }
 
+function newestStarted(f) {
+  const newest = [...f.sessions].sort((a, b) => b.birth - a.birth)[0];
+  return newest && newest.id;
+}
+
 async function enterFloor(f, sessionId, animate = true) {
   const prev = app.floor ? app.floor.floor : 1;
   if (sessionId === undefined || sessionId === null) app.autoFollow = true;
   // 따로 고르지 않았으면 자동 따라가기와 같은 기준(가장 나중에 시작한 세션)으로 연다
-  const newest = [...f.sessions].sort((a, b) => b.birth - a.birth)[0];
-  const sid = sessionId || (newest && newest.id);
+  const sid = sessionId || newestStarted(f);
   // 엘리베이터가 도는 동안에는 이전 층에 머문다. 층과 세션은 도착할 때 함께 바꾼다.
   if (animate && prev !== f.floor) {
     app.riding = true;
@@ -731,10 +742,11 @@ async function poll(token, floorId, sid) {
     if (token !== app.sessionToken) return;
     const town = app.town;
     Object.assign(town.subsMeta, data.subs || {});
-    app.sessionActive = data.session.active;
     if (data.reset) { openSession(app.floor, sid); return; }
     if (first || data.initial) { town.replay(data.events, data.session.active); first = false; }
     else for (const ev of data.events) town.handle(ev);
+    // 기록 파일이 2분 넘게 조용해도 끝나지 않은 도구를 기다리는 중이면 LIVE로 본다
+    app.sessionActive = data.session.active || town.waiting();
     app.cursor = data.cursor;
     renderHeader();
     if (!data.session.more) await sleep(POLL_MS);
@@ -766,8 +778,9 @@ function renderFloors() {
   const old = sorted.filter(f => !recent.includes(f));
   const item = f => {
     const cur = app.floor && f.id === app.floor.id;
-    let html = `<li class="floor ${cur ? 'current' : ''} ${f.active ? 'lit' : ''}" data-floor="${esc(f.id)}">
-      <div class="frow"><span class="fnum">${f.floor}F</span><span class="fname">${esc(f.name)}</span><span class="light" title="${f.active ? '지금 일하는 중' : '불 꺼짐'}"></span></div>
+    const lit = f.active || (cur && app.sessionActive);
+    let html = `<li class="floor ${cur ? 'current' : ''} ${lit ? 'lit' : ''}" data-floor="${esc(f.id)}">
+      <div class="frow"><span class="fnum">${f.floor}F</span><span class="fname">${esc(f.name)}</span><span class="light" title="${lit ? '지금 일하는 중' : '불 꺼짐'}"></span></div>
       <div class="fmeta">세션 ${f.sessionCount}개 · ${ago(now - f.lastActive)}</div>`;
     if (cur) {
       const list = app.showAllSessions ? f.sessions : f.sessions.slice(0, 8);
@@ -783,6 +796,24 @@ function renderFloors() {
   box.innerHTML = recent.map(item).join('') +
     (old.length ? `<li class="oldtoggle" data-old="1">${app.showOld ? '▾' : '▸'} 불 꺼진 지 오래된 층 ${old.length}개</li>` + (app.showOld ? old.map(item).join('') : '') : '');
 }
+
+// 이미 열린 탭에서 북마크를 누르거나 주소창의 #floor=… 를 고치면 그 층·세션으로 옮긴다
+window.addEventListener('hashchange', () => {
+  const h = new URLSearchParams(location.hash.slice(1));
+  const f = app.floors.find(x => x.id === h.get('floor'));
+  if (!f) return;
+  const want = h.get('session');
+  const sid = want && f.sessions.some(s => s.id === want) ? want : null;
+  if (app.floor && f.id === app.floor.id) {
+    if (sid ? sid === app.session && !app.autoFollow : app.autoFollow) return;
+    app.autoFollow = !sid;
+    openSession(f, sid || newestStarted(f));
+    renderFloors();
+    return;
+  }
+  app.autoFollow = !sid;
+  enterFloor(f, sid, true);
+});
 
 $('#floors').addEventListener('click', e => {
   const t = e.target.closest('[data-session],[data-follow],[data-more],[data-old],[data-floor]');
