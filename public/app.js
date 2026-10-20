@@ -76,6 +76,8 @@ function describeTool(name, i = {}) {
   }
 }
 
+const RESUMED_QUIET_MS = 30000;   // 다시 일하러 간 서브에이전트가 이만큼 조용하면 끝난 것으로 본다
+
 const CLAUDE_PROPS = { library: 'glasses', dev: 'hardhat', server: 'headset', info: 'antenna', meeting: 'beret' };
 
 const LONG_TOOLS = new Set(['Bash', 'BashOutput', 'Monitor', 'Task', 'Agent', 'WebFetch', 'WebSearch', 'AskUserQuestion', 'SendMessage']);
@@ -242,8 +244,9 @@ class Town {
     if (!a || a.gone) return;
     a.lastAt = now;
     if (a.kind === 'sub' && (a.state === 'reporting' || a.state === 'leaving') && (ev.k === 'tool' || ev.k === 'think')) {
-      // 보고하러 가다가 일을 하나 더 받으면 다시 일하러 돌아간다
-      a.state = 'working'; a.alpha = 1; a.emote = null; a.eyes = null; a.mouth = null;
+      // 보고하러 가다가 일을 하나 더 받으면 다시 일하러 돌아간다. 이때는 끝났다는 신호(Task 결과)가 다시 오지 않으므로
+      // 기록이 한동안 멈추면 알아서 다시 보고하러 간다 (updateSubs)
+      a.state = 'working'; a.alpha = 1; a.emote = null; a.eyes = null; a.mouth = null; a.resumed = true;
       this.log(a, '↩️ 일이 더 생겨서 돌아가요', { t: ev.t });
     }
 
@@ -491,7 +494,16 @@ class Town {
     // 방마다 쓰는 작업 소품
     c.prop = c.arrived && c.state === 'working' ? (CLAUDE_PROPS[c.room] || null) : null;
     this.updateNpcs(pnow);
+    this.updateSubs(now, live);
     this.world.elevatorOpen += ((now < this.elevatorUntil ? 1 : 0) - this.world.elevatorOpen) * Math.min(1, dt * 6);
+  }
+
+  updateSubs(now, live) {
+    for (const a of this.subs.values()) {
+      if (!a.resumed || a.gone || a.state !== 'working' || a.moving) continue;
+      const busy = [...this.pending.values()].some(p => p.agent === a);
+      if (!busy && (now - a.lastAt > RESUMED_QUIET_MS || !live)) { a.resumed = false; this.finishSub(a, { text: '', err: false }); }
+    }
   }
 
   updateNpcs(pnow) {
@@ -639,6 +651,7 @@ async function refreshFloors() {
     renderFloors();
     renderHeader();
     $('#empty').hidden = app.floors.length > 0;
+    $('#emptyRoot').textContent = data.root;
   } catch (e) {
     console.warn(e);
   }
@@ -647,7 +660,9 @@ async function refreshFloors() {
 async function enterFloor(f, sessionId, animate = true) {
   const prev = app.floor ? app.floor.floor : 1;
   if (sessionId === undefined || sessionId === null) app.autoFollow = true;
-  const sid = sessionId || (f.sessions[0] && f.sessions[0].id);
+  // 따로 고르지 않았으면 자동 따라가기와 같은 기준(가장 나중에 시작한 세션)으로 연다
+  const newest = [...f.sessions].sort((a, b) => b.birth - a.birth)[0];
+  const sid = sessionId || (newest && newest.id);
   // 엘리베이터가 도는 동안에는 이전 층에 머문다. 층과 세션은 도착할 때 함께 바꾼다.
   if (animate && prev !== f.floor) {
     app.riding = true;

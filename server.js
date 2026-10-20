@@ -33,6 +33,8 @@ function parseArgs(argv) {
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (!a.startsWith('--')) continue;
+    const eq = a.indexOf('=');
+    if (eq > 2) { out[a.slice(2, eq)] = a.slice(eq + 1); continue; }   // --port=5000
     const key = a.slice(2);
     const next = argv[i + 1];
     if (next && !next.startsWith('--')) { out[key] = next; i++; } else out[key] = true;
@@ -205,6 +207,19 @@ function sessionInfo(file, st) {
   return info;
 }
 
+// 세션의 서브에이전트 기록 가운데 가장 최근에 바뀐 시각. 서브에이전트만 일하는 동안에도 불이 켜져 있게 한다.
+function newestSubagentWrite(floorDir, sessionId, oldFormat) {
+  let newest = 0;
+  try {
+    const dir = path.join(floorDir, sessionId, 'subagents');
+    for (const f of fs.readdirSync(dir)) {
+      if (!f.endsWith('.jsonl')) continue;
+      try { newest = Math.max(newest, fs.statSync(path.join(dir, f)).mtimeMs); } catch { /* 지워짐 */ }
+    }
+  } catch { /* 하위 폴더 없음 */ }
+  return Math.max(newest, oldFormat.get(sessionId) || 0);
+}
+
 // 디렉터리 이름(-Users-me-work-app)에서 경로를 대충 복원한다. 실제 cwd가 기록에 있으면 그걸 쓴다.
 function guessCwd(dirName) { return dirName.replace(/-/g, '/'); }
 
@@ -219,6 +234,16 @@ function listFloors() {
     let files;
     try { files = fs.readdirSync(dir, { withFileTypes: true }); } catch { continue; }
     const sessions = [];
+    // 예전 형식(agent-*.jsonl)의 서브에이전트 기록: 최근 것만 어느 세션 것인지 확인한다
+    const oldFormat = new Map();
+    for (const f of files) {
+      if (!f.isFile() || !f.name.startsWith('agent-') || !f.name.endsWith('.jsonl')) continue;
+      let st;
+      try { st = fs.statSync(path.join(dir, f.name)); } catch { continue; }
+      if (now - st.mtimeMs > ACTIVE_MS) continue;
+      const sid = subagentHead(path.join(dir, f.name), st).sessionId;
+      if (sid) oldFormat.set(sid, Math.max(oldFormat.get(sid) || 0, st.mtimeMs));
+    }
     for (const f of files) {
       if (!f.isFile() || !f.name.endsWith('.jsonl') || f.name.startsWith('agent-')) continue;
       const id = f.name.slice(0, -6);
@@ -228,8 +253,10 @@ function listFloors() {
       try { st = fs.statSync(file); } catch { continue; }
       const info = sessionInfo(file, st);
       if (!info.hasMessages) continue;
+      // 하루 넘게 조용한 세션은 서브에이전트 폴더까지 뒤지지 않는다
+      const mtime = now - st.mtimeMs < 86400e3 ? Math.max(st.mtimeMs, newestSubagentWrite(dir, id, oldFormat)) : st.mtimeMs;
       sessions.push({ id, title: info.title || '제목 없는 세션', cwd: info.cwd, birth: info.birth,
-        mtime: st.mtimeMs, active: now - st.mtimeMs < ACTIVE_MS });
+        mtime, active: now - mtime < ACTIVE_MS });
     }
     if (!sessions.length) continue;
     sessions.sort((a, b) => b.mtime - a.mtime);
@@ -339,9 +366,11 @@ function sessionDelta(floorId, sessionId, cursor) {
   const subsMeta = {};
   const prevSubs = (cursor && cursor.s) || {};
   const now = Date.now();
+  let lastWrite = main.mtime;
   for (const sub of findSubagents(floorDir, sessionId)) {
     let st;
     try { st = fs.statSync(sub.file); } catch { continue; }
+    lastWrite = Math.max(lastWrite, st.mtimeMs);
     const head = subagentHead(sub.file, st);
     subsMeta[sub.key] = { prompt: head.prompt, agentId: head.agentId, agentType: sub.agentType || '', mtime: st.mtimeMs };
     let off = prevSubs[sub.key];
@@ -363,7 +392,7 @@ function sessionDelta(floorId, sessionId, cursor) {
     reset: main.reset,
     cursor: { m: main.offset, s: nextSubs },
     subs: subsMeta,
-    session: { id: sessionId, mtime: main.mtime, active: now - main.mtime < ACTIVE_MS, more: main.offset < main.size },
+    session: { id: sessionId, mtime: lastWrite, active: now - lastWrite < ACTIVE_MS, more: main.offset < main.size },
   };
 }
 
@@ -392,7 +421,8 @@ function serveStatic(req, res, pathname) {
 const server = http.createServer((req, res) => {
   const url = new URL(req.url, 'http://localhost');
   // 다른 사이트가 이 서버를 읽어 가지 못하도록 Host 헤더를 확인한다 (DNS 리바인딩 방지)
-  const host = (req.headers.host || '').split(':')[0];
+  const rawHost = req.headers.host || '';
+  const host = rawHost.startsWith('[') ? rawHost.slice(0, rawHost.indexOf(']') + 1) : rawHost.split(':')[0];
   if (!['localhost', '127.0.0.1', '[::1]', HOST].includes(host)) { res.writeHead(403); return res.end(); }
   try {
     if (url.pathname === '/api/floors') {
