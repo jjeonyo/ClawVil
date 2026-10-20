@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>PokeAI 마을</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🏝️</text></svg>">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Gowun+Dodum&family=Jua&display=swap">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div id="app">
+    <aside id="left" class="panel">
+      <header class="sign"><span>층별 안내</span><small>FLOOR GUIDE</small></header>
+      <ul id="floors"></ul>
+      <footer class="root" id="rootPath"></footer>
+    </aside>
+
+    <main id="stage">
+      <div id="topbar">
+        <div class="where">
+          <span id="floorBadge" class="badge">–</span>
+          <div class="names"><b id="floorName">불러오는 중…</b><span id="sessionTitle"></span></div>
+        </div>
+        <span id="themeLabel" class="theme"></span>
+        <span id="live" class="live"><i></i><span>…</span></span>
+      </div>
+      <canvas id="town"></canvas>
+      <div id="zoom">
+        <button id="zoomIn" title="확대">＋</button>
+        <button id="zoomOut" title="축소">－</button>
+        <button id="zoomFit" title="한눈에 보기">⟳</button>
+      </div>
+      <div id="hint">드래그로 이동 · 휠로 확대</div>
+      <div id="elevator" hidden><div class="lift"><span id="elevatorArrow">▲</span><span id="elevatorNum">1F</span></div></div>
+      <div id="toast"></div>
+      <div id="empty" hidden>
+        <h2>아직 마을이 비어 있어요</h2>
+        <p>Claude Code 세션 기록(<code>~/.claude/projects</code>)을 찾지 못했어요.<br>
+          Claude Code를 한 번 실행하거나, <code>node server.js --demo</code> 로 데모를 볼 수 있어요.</p>
+      </div>
+    </main>
+
+    <aside id="right" class="panel">
+      <section class="meta">
+        <div><small>프로젝트</small><span id="cwd"></span></div>
+        <div><small>세션</small><span id="sid"></span></div>
+      </section>
+      <section>
+        <header class="sign small"><span>사무실 사람들</span><small id="peopleCount"></small></header>
+        <ul id="people"></ul>
+      </section>
+      <section class="grow">
+        <header class="sign small"><span>활동 로그</span></header>
+        <ul id="logs"></ul>
+      </section>
+      <section>
+        <header class="sign small"><span>어디서 무엇을 하나</span></header>
+        <ul id="legend"></ul>
+      </section>
+    </aside>
+  </div>
+  <script type="module" src="app.js"></script>
+</body>
+</html>

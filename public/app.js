@@ -1,0 +1,813 @@
+// 세션 기록을 받아 캐릭터를 움직이고, 층 안내·사람 목록·활동 로그를 그린다.
+import { buildWorld, findPath, render, iso, GW, GH, ROOMS, THEMES, themeForFloor } from './world.js';
+import { SPECIES, speciesForAgent } from './pokemon.js';
+
+const POLL_MS = 250;
+const FLOORS_MS = 2000;
+const OLD_FLOOR_MS = 3 * 86400e3;
+const CLAUDE_COLOR = '#d97757';
+
+const $ = sel => document.querySelector(sel);
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+const esc = s => String(s == null ? '' : s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const baseName = p => (p ? String(p).split(/[\\/]/).filter(Boolean).pop() : '');
+const short = (s, n) => { s = String(s || ''); return s.length > n ? s.slice(0, n - 1) + '…' : s; };
+
+function ago(ms) {
+  const s = Math.max(0, Math.round(ms / 1000));
+  if (s < 60) return s + '초 전';
+  if (s < 3600) return Math.floor(s / 60) + '분 전';
+  if (s < 86400) return Math.floor(s / 3600) + '시간 전';
+  return Math.floor(s / 86400) + '일 전';
+}
+function dur(ms) {
+  const s = Math.max(0, Math.round(ms / 1000));
+  return s < 60 ? s + '초' : s < 3600 ? Math.floor(s / 60) + '분 ' + (s % 60) + '초' : Math.floor(s / 3600) + '시간 ' + Math.floor(s / 60 % 60) + '분';
+}
+function clock(t) {
+  const d = new Date(t || Date.now());
+  return d.toLocaleTimeString('ko-KR', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+}
+
+// ---------------------------------------------------------------- 도구 → 방
+
+function roomForTool(name) {
+  if (/^mcp__/.test(name)) return 'info';
+  switch (name) {
+    case 'Read': case 'Grep': case 'Glob': case 'LS': case 'NotebookRead': return 'library';
+    case 'Edit': case 'Write': case 'MultiEdit': case 'NotebookEdit': return 'dev';
+    case 'Bash': case 'BashOutput': case 'KillShell': case 'KillBash': case 'Monitor': case 'PowerShell': return 'server';
+    case 'WebSearch': case 'WebFetch': case 'ToolSearch': case 'ListMcpResourcesTool': case 'ReadMcpResourceTool': return 'info';
+    case 'TodoWrite': case 'TaskCreate': case 'TaskUpdate': case 'TaskList': case 'TaskGet': case 'TaskOutput':
+    case 'EnterPlanMode': case 'ExitPlanMode': case 'Skill': return 'meeting';
+    case 'AskUserQuestion': return 'ask';
+    case 'Task': case 'Agent': case 'SendMessage': return 'desk';
+    default: return 'dev';
+  }
+}
+
+function hostOf(u) { try { return new URL(u).host; } catch { return u || ''; } }
+
+function describeTool(name, i = {}) {
+  switch (name) {
+    case 'Read': return `📖 ${baseName(i.file_path) || '파일'} 읽는 중`;
+    case 'NotebookRead': return `📖 ${baseName(i.notebook_path)} 읽는 중`;
+    case 'Grep': return `🔎 "${short(i.pattern, 24)}" 찾는 중`;
+    case 'Glob': return `🗂️ ${short(i.pattern, 24)} 훑는 중`;
+    case 'LS': return `🗂️ ${baseName(i.path)} 살펴보는 중`;
+    case 'Edit': case 'MultiEdit': return `✏️ ${baseName(i.file_path)} 고치는 중`;
+    case 'Write': return `📝 ${baseName(i.file_path)} 쓰는 중`;
+    case 'NotebookEdit': return `✏️ ${baseName(i.notebook_path)} 고치는 중`;
+    case 'Bash': return `⚙️ ${short(i.description || i.command, 40)}`;
+    case 'BashOutput': case 'Monitor': return '⚙️ 실행 결과 지켜보는 중';
+    case 'WebSearch': return `🌐 "${short(i.query, 28)}" 검색`;
+    case 'WebFetch': return `🌐 ${hostOf(i.url)} 읽는 중`;
+    case 'ToolSearch': return '🧰 도구 찾는 중';
+    case 'TodoWrite': return '📝 할 일 정리 중';
+    case 'TaskCreate': case 'TaskUpdate': return `📝 ${short(i.subject || i.description || '할 일', 28)}`;
+    case 'EnterPlanMode': case 'ExitPlanMode': return '🗺️ 계획 세우는 중';
+    case 'Skill': return `📘 ${i.skill || '스킬'} 펼쳐 보는 중`;
+    case 'AskUserQuestion': return `❓ ${short(i.question || '확인할 게 있어요', 60)}`;
+    case 'Task': case 'Agent': return `📞 ${i.subagent_type || '도우미'} 호출 · ${short(i.description, 24)}`;
+    case 'SendMessage': return `📞 ${i.to || '동료'}에게 연락`;
+    default:
+      if (/^mcp__/.test(name)) return `🔌 ${name.split('__').slice(1).join(' · ')}`;
+      return `🔧 ${name}`;
+  }
+}
+
+const LONG_TOOLS = new Set(['Bash', 'BashOutput', 'Monitor', 'Task', 'Agent', 'WebFetch', 'WebSearch', 'AskUserQuestion', 'SendMessage']);
+
+// ---------------------------------------------------------------- 캐릭터
+
+class Agent {
+  constructor(o) {
+    Object.assign(this, {
+      x: 0, y: 0, path: [], speed: 3.4, facing: 1, bubble: null, emote: null, sweatUntil: 0,
+      state: 'idle', activity: '대기 중', tools: 0, since: Date.now(), lastAt: Date.now(),
+      seed: Math.random() * 10, alpha: 1, hidden: false, token: 0, spot: null, mouth: null,
+    }, o);
+  }
+  get moving() { return this.path.length > 0; }
+  get sweat() { return Date.now() < this.sweatUntil; }
+  say(type, text, ms = 3500) { this.bubble = { type, text, until: ms ? Date.now() + ms : Infinity }; }
+}
+
+// ---------------------------------------------------------------- 마을(한 세션)
+
+class Town {
+  constructor(world, opts) {
+    this.world = world;
+    this.opts = opts;
+    this.chars = [];
+    this.subs = new Map();        // Task tool_use id → Agent
+    this.subByFile = new Map();   // 서브에이전트 기록 파일 → Agent
+    this.subsMeta = {};
+    this.pending = new Map();     // tool_use id → { agent, ev, at }
+    this.reserved = new Map();    // spot → Agent
+    this.timers = [];
+    this.logs = [];
+    this.replaying = false;
+    this.turnActive = false;
+    this.lastEventAt = 0;
+    this.elevatorUntil = 0;
+    this.phoneUntil = 0;
+    this.userTypingUntil = 0;
+    this.dirty = true;
+
+    this.user = this.add(new Agent({ id: 'user', kind: 'user', species: 'trainer', label: opts.userName + ' (나)', color: '#e8483f', speed: 2.5 }));
+    this.place(this.user, world.userSeat);
+    this.claude = this.add(new Agent({ id: 'claude', kind: 'claude', species: 'ditto', label: 'Claude', color: CLAUDE_COLOR }));
+    this.place(this.claude, world.claudeSeat);
+  }
+
+  add(a) { this.chars.push(a); return a; }
+
+  // -------- 위치
+
+  place(a, spot) { a.x = spot.x; a.y = spot.y; a.path = []; a.facing = spot.face || a.facing; a.arrived = true; }
+
+  release(a) { if (a.spot && this.reserved.get(a.spot) === a) this.reserved.delete(a.spot); a.spot = null; }
+
+  reserve(a, list) {
+    if (a.spot && list.includes(a.spot)) return a.spot;
+    const free = list.filter(s => !this.reserved.has(s));
+    const pick = free.length ? free[Math.floor(Math.random() * free.length)] : list[Math.floor(Math.random() * list.length)];
+    this.release(a);
+    a.spot = pick;
+    if (!this.reserved.has(pick)) this.reserved.set(pick, a);
+    return pick;
+  }
+
+  walk(a, spot, onArrive) {
+    a.token++;
+    const token = a.token;
+    a.arrived = false;
+    a.onArrive = () => { if (a.token === token) { a.arrived = true; a.facing = spot.face || a.facing; onArrive && onArrive(); } };
+    if (this.replaying) { this.place(a, spot); a.onArrive(); return; }
+    a.path = findPath(this.world, a, spot);
+    a.target = spot;
+  }
+
+  goRoom(a, room, onArrive) {
+    let spot;
+    if (room === 'desk') { this.release(a); spot = a === this.claude ? this.world.claudeSeat : this.reserve(a, this.world.spots.report); }
+    else if (room === 'ask') spot = this.reserve(a, this.world.spots.ask);
+    else spot = this.reserve(a, this.world.spots[room] || this.world.spots.dev);
+    a.room = room;
+    if (a.target === spot && (a.moving || a.arrived)) { if (a.arrived && onArrive) onArrive(); return; }
+    this.walk(a, spot, onArrive);
+  }
+
+  // Claude가 지금 있는(또는 가고 있는) 자리 바로 옆 빈칸
+  spotNearClaude(a) {
+    const c = this.claude;
+    const base = c.target && !c.arrived ? c.target : c;
+    const cx = Math.floor(base.x), cy = Math.floor(base.y);
+    const taken = [...this.reserved.entries()].filter(([, who]) => who !== a).map(([s]) => Math.floor(s.x) + ',' + Math.floor(s.y));
+    for (const [dx, dy] of [[1, 0], [-1, 0], [0, 1], [1, 1], [-1, 1], [0, -1], [1, -1], [-1, -1], [2, 0], [-2, 0], [0, 2], [2, 1]]) {
+      const x = cx + dx, y = cy + dy;
+      if (x < 1 || y < 1 || x >= GW - 1 || y >= GH - 1) continue;
+      if (this.world.blocked.has(this.world.key(x, y)) || taken.includes(x + ',' + y)) continue;
+      return { x: x + 0.5, y: y + 0.5, face: dx > 0 ? -1 : 1, room: c.room };
+    }
+    return this.world.spots.report[0];
+  }
+
+  later(ms, a, fn) {
+    if (this.replaying) { fn(); return; }
+    const token = a ? a.token : null;
+    this.timers.push({ at: performance.now() + ms, fn, a, token });
+  }
+
+  // -------- 로그
+
+  log(who, text, opts = {}) {
+    this.logs.unshift({ t: opts.t || Date.now(), who: who.label || who, color: who.color || '#888', text, err: !!opts.err });
+    if (this.logs.length > 120) this.logs.length = 120;
+    this.dirty = true;
+  }
+
+  // -------- 이벤트 처리
+
+  actorFor(ev) {
+    if (ev.src === 'main') {
+      if (ev.side) {
+        // 예전 버전: 서브에이전트 기록이 메인 파일에 섞여 있다
+        const busy = [...this.subs.values()].filter(s => !s.gone);
+        return busy[busy.length - 1] || this.claude;
+      }
+      return this.claude;
+    }
+    const key = ev.src.slice(4);
+    return this.subByFile.get(key) || this.linkSub(key, ev);
+  }
+
+  linkSub(key, ev) {
+    const meta = this.subsMeta[key] || {};
+    const norm = s => String(s || '').replace(/\s+/g, ' ').trim().slice(0, 80);
+    const cands = [...this.subs.values()].filter(s => !s.fileKey && !s.gone);
+    let a = cands.find(s => meta.agentId && s.agentId === meta.agentId)
+      || cands.find(s => meta.prompt && norm(s.prompt) === norm(meta.prompt))
+      || cands[0];
+    if (!a) {
+      // Task 호출이 읽은 범위 밖에 있었던 경우: 기록만 보고 데려온다
+      a = this.spawnSub({ id: 'file:' + key, t: ev && ev.t, input: { subagent_type: meta.agentType || '', description: short(meta.prompt, 20), prompt: meta.prompt } }, true);
+    }
+    a.fileKey = key;
+    this.subByFile.set(key, a);
+    return a;
+  }
+
+  handle(ev) {
+    const now = Date.now();
+    if (ev.t) this.lastEventAt = Math.max(this.lastEventAt, ev.t);
+    if (ev.k === 'title') { this.opts.onTitle && this.opts.onTitle(ev.text); return; }
+    const a = this.actorFor(ev);
+    if (!a || a.gone) return;
+    a.lastAt = now;
+    if (a.kind === 'sub' && (a.state === 'reporting' || a.state === 'leaving') && (ev.k === 'tool' || ev.k === 'think')) {
+      // 보고하러 가다가 일을 하나 더 받으면 다시 일하러 돌아간다
+      a.state = 'working'; a.alpha = 1; a.emote = null;
+      this.log(a, '↩️ 일이 더 생겨서 돌아가요', { t: ev.t });
+    }
+
+    switch (ev.k) {
+      case 'prompt': {
+        if (a.kind === 'sub') { a.activity = '맡은 일 확인 중'; break; }
+        this.turnActive = true;
+        this.user.say('say', ev.text, 5000);
+        this.userTypingUntil = now + 2500;
+        this.claude.state = 'working'; this.claude.activity = '요청 확인 중'; this.claude.emote = null; this.claude.mouth = null;
+        this.log(this.user, '💬 ' + ev.text, { t: ev.t });
+        break;
+      }
+      case 'command': {
+        this.log(this.user, '⌨️ ' + ev.text, { t: ev.t });
+        if (ev.text === '/clear' || ev.text === '/compact') this.claude.say('say', ev.text === '/clear' ? '새 세션 시작!' : '기억 정리 중…', 2500);
+        break;
+      }
+      case 'interrupt': this.endTurn('⛔ 중단됨', ev.t); break;
+      case 'think': {
+        a.state = 'working'; a.thinkingSince = now; a.emote = null;
+        a.say('think', ev.text || '생각 중…', 7000);
+        if (ev.text) this.log(a, '💭 ' + ev.text, { t: ev.t });
+        break;
+      }
+      case 'tool': this.onTool(a, ev); break;
+      case 'result': this.onResult(ev); break;
+      case 'text': {
+        if (a.kind === 'sub') { a.say('say', ev.text, 3000); break; }
+        a.say('say', ev.text, 6000);
+        this.log(a, '💬 ' + ev.text, { t: ev.t });
+        if (ev.stop === 'end_turn') this.endTurn(null, ev.t);
+        break;
+      }
+      case 'stop': if (a === this.claude && this.turnActive) this.endTurn(null, ev.t); break;
+      case 'apierr': a.say('err', 'API 오류: ' + (ev.text || ''), 4000); a.sweatUntil = now + 4000; this.log(a, '⚠️ ' + (ev.text || 'API 오류'), { t: ev.t, err: true }); break;
+      case 'compact': this.log(a, '🧹 대화 압축', { t: ev.t }); break;
+    }
+  }
+
+  onTool(a, ev) {
+    const now = Date.now();
+    const name = ev.name;
+    const room = roomForTool(name);
+    const what = describeTool(name, ev.input);
+    a.tools++; a.state = 'working'; a.activity = what; a.thinkingSince = null; a.emote = null; a.mouth = null;
+    if (a === this.claude) this.turnActive = true;
+    this.pending.set(ev.id, { agent: a, ev, at: now });
+    this.log(a, what, { t: ev.t });
+
+    if ((name === 'Task' || name === 'Agent') && a === this.claude) {
+      // 자기 자리에서 전화를 걸고, 새 에이전트가 엘리베이터로 출근한다
+      this.goRoom(a, 'desk', () => { a.emote = 'phone'; this.phoneUntil = Date.now() + 2600; });
+      a.say('call', `📞 ${ev.input.subagent_type || '도우미'}님, ${ev.input.description || '부탁해요'}`, 3200);
+      this.spawnSub(ev, this.replaying);
+      return;
+    }
+    if (room === 'ask') {
+      this.goRoom(a, 'ask', () => { a.facing = -1; });
+      a.say('ask', ev.input.question || '확인할 게 있어요', 0);
+      return;
+    }
+    if (todosOf(ev)) { this.world.todos = todosOf(ev); }
+    a.say('say', what, 0);
+    this.goRoom(a, room, () => { if (room === 'library') a.emote = 'read'; });
+  }
+
+  onResult(ev) {
+    const p = this.pending.get(ev.id);
+    const sub = this.subs.get(ev.id);
+    if (sub && !sub.gone) this.finishSub(sub, ev);
+    if (!p) return;
+    this.pending.delete(ev.id);
+    const a = p.agent;
+    if (a.bubble && (a.bubble.type === 'say' || a.bubble.type === 'ask') && a.bubble.until === Infinity) a.bubble = null;
+    if (a.emote === 'read' || a.emote === 'phone') a.emote = null;
+    if (ev.err) {
+      a.sweatUntil = Date.now() + 4500;
+      a.mouth = 'worried';
+      a.say('err', '앗… ' + (ev.text || p.ev.name + ' 실패'), 4500);
+      this.log(a, `💦 ${p.ev.name} 실패: ${ev.text || ''}`, { t: ev.t, err: true });
+      this.later(4500, a, () => { a.mouth = null; });
+    } else if (p.ev.name === 'AskUserQuestion') {
+      this.user.say('say', ev.text || '응!', 3000);
+      this.log(this.user, '🙋 ' + (ev.text || '답변'), { t: ev.t });
+    }
+  }
+
+  spawnSub(ev, instant) {
+    const i = ev.input || {};
+    const type = i.subagent_type || 'general-purpose';
+    const species = speciesForAgent(type);
+    const a = this.add(new Agent({
+      id: ev.id, kind: 'sub', type, species, color: SPECIES[species].color,
+      label: short(type, 16), desc: i.description || '', prompt: i.prompt || '',
+      glasses: /plan/i.test(type), hat: /explore/i.test(type),
+      activity: '출근 중', state: 'arriving', speed: 3.2, since: ev.t || Date.now(),
+    }));
+    this.subs.set(ev.id, a);
+    const room = /explore/i.test(type) ? 'library' : /plan/i.test(type) ? 'meeting' : 'dev';
+    if (instant || this.replaying) {
+      a.state = 'working'; a.activity = '일하는 중';
+      this.place(a, this.reserve(a, this.world.spots[room]));
+      a.room = room;
+      return a;
+    }
+    a.hidden = true;
+    this.later(1300, null, () => {
+      this.elevatorUntil = Date.now() + 1800;
+      this.place(a, this.world.elevatorDoor);
+      a.hidden = false; a.alpha = 0;
+      a.say('say', '안녕하세요! 출근했어요', 2200);
+      this.log(a, `🛗 출근 · ${a.desc}`);
+      this.later(450, null, () => {
+        a.alpha = 1;
+        if (a.state === 'arriving') { a.state = 'working'; a.activity = '일하러 가는 중'; this.goRoom(a, room, () => { if (room === 'library') a.emote = 'read'; }); }
+      });
+    });
+    return a;
+  }
+
+  finishSub(a, ev) {
+    for (const [id, p] of this.pending) if (p.agent === a) this.pending.delete(id);
+    if (this.replaying) { this.removeSub(a); return; }
+    a.state = 'reporting'; a.activity = '보고하러 가는 중'; a.emote = null; a.bubble = null;
+    const spot = this.spotNearClaude(a);
+    this.release(a);
+    a.spot = spot; this.reserved.set(spot, a); a.room = 'report';
+    this.walk(a, spot, () => {
+      if (a.state !== 'reporting') return;
+      a.facing = a.x < this.claude.x ? 1 : -1;
+      a.say(ev.err ? 'err' : 'report', (ev.err ? '죄송해요… ' : '보고: ') + (ev.text || '다 했어요!'), 3200);
+      this.log(a, (ev.err ? '😓 ' : '📋 ') + 'Claude에게 보고', { err: ev.err });
+      this.later(3200, a, () => {
+        if (a.state !== 'reporting') return;
+        a.say('say', '👋 퇴근합니다!', 2000); a.emote = 'wave';
+        this.later(1600, a, () => {
+          if (a.state !== 'reporting') return;
+          a.state = 'leaving'; a.activity = '퇴근 중'; a.emote = null;
+          this.release(a);
+          this.walk(a, this.world.elevatorDoor, () => {
+            if (a.state !== 'leaving') return;
+            this.elevatorUntil = Date.now() + 1500;
+            this.log(a, '🛗 퇴근');
+            this.later(350, a, () => { a.alpha = 0.4; });
+            this.later(700, a, () => this.removeSub(a));
+          });
+        });
+      });
+    });
+  }
+
+  removeSub(a) {
+    a.gone = true;
+    this.release(a);
+    this.chars = this.chars.filter(c => c !== a);
+    for (const [k, v] of this.subs) if (v === a) this.subs.delete(k);
+    if (a.fileKey) this.subByFile.delete(a.fileKey);
+    this.dirty = true;
+  }
+
+  endTurn(msg, t) {
+    this.turnActive = false;
+    for (const [id, p] of this.pending) if (p.agent === this.claude) this.pending.delete(id);
+    const c = this.claude;
+    c.state = 'idle'; c.activity = '대기 중'; c.emote = null; c.mouth = null; c.since = Date.now();
+    if (msg) { c.say('say', msg, 2500); this.log(c, msg, { t }); }
+    if (c.bubble && c.bubble.until === Infinity) c.bubble = null;
+    this.goRoom(c, 'desk');
+  }
+
+  // 처음 열 때 지나간 기록을 순식간에 재생해 현재 상태를 맞춘다
+  replay(events, sessionActive) {
+    this.replaying = true;
+    for (const ev of events) this.handle(ev);
+    this.replaying = false;
+    for (const ch of this.chars) ch.bubble = null;
+    const quietFor = Date.now() - (this.lastEventAt || 0);
+    if (!sessionActive || quietFor > 10 * 60e3) {
+      for (const a of [...this.subs.values()]) this.removeSub(a);
+      this.pending.clear();
+      if (this.turnActive || this.claude.state !== 'idle') this.endTurn(null);
+      this.place(this.claude, this.world.claudeSeat);
+    } else {
+      // 진행 중인 도구가 있으면 그 말풍선을 다시 띄운다
+      for (const p of this.pending.values()) {
+        if (p.ev.name === 'AskUserQuestion') p.agent.say('ask', p.ev.input.question || '확인할 게 있어요', 0);
+        else if (!['Task', 'Agent'].includes(p.ev.name)) p.agent.say('say', describeTool(p.ev.name, p.ev.input), 0);
+      }
+    }
+    this.claude.since = this.lastEventAt || Date.now();
+    this.dirty = true;
+  }
+
+  // -------- 매 프레임
+
+  update(dt, live) {
+    const now = Date.now();
+    const pnow = performance.now();
+    if (this.timers.length) {
+      const due = this.timers.filter(tm => tm.at <= pnow);
+      this.timers = this.timers.filter(tm => tm.at > pnow);
+      for (const tm of due) if (!tm.a || tm.a.token === tm.token || tm.token === null) tm.fn();
+    }
+    for (const a of this.chars) {
+      if (a.path.length) {
+        const p = a.path[0];
+        const dx = p.x - a.x, dy = p.y - a.y;
+        const dist = Math.hypot(dx, dy);
+        const step = a.speed * dt;
+        if (dx - dy !== 0) a.facing = dx - dy > 0 ? 1 : -1;
+        if (dist <= step) { a.x = p.x; a.y = p.y; a.path.shift(); if (!a.path.length && a.onArrive) a.onArrive(); }
+        else { a.x += dx / dist * step; a.y += dy / dist * step; }
+      }
+      if (a.bubble && now > a.bubble.until) a.bubble = null;
+    }
+    const c = this.claude;
+    // 오래 조용하면 고민하거나 졸기
+    if (c.state === 'working' && !c.moving) {
+      const quiet = now - c.lastAt;
+      const hasPending = [...this.pending.values()].some(p => p.agent === c);
+      if (!hasPending && quiet > 20000 && live) {
+        c.emote = 'ponder';
+        if (!c.bubble) c.say('think', `고민 중… ${Math.round(quiet / 1000)}초째`, 1200);
+      }
+      for (const p of this.pending.values()) {
+        if (p.agent !== c || LONG_TOOLS.has(p.ev.name) || /^mcp__/.test(p.ev.name) || p.asked) continue;
+        if (now - p.at > 7000 && live) { p.asked = true; c.say('ask', '⏳ 승인 기다리는 중일까요?', 0); }
+      }
+    }
+    if (c.state === 'idle' && !c.moving) c.emote = now - c.since > 3 * 60e3 ? 'sleep' : (c.emote === 'sleep' ? null : c.emote);
+    if (c.emote === 'phone' && now > this.phoneUntil) c.emote = null;
+    this.world.elevatorOpen += ((now < this.elevatorUntil ? 1 : 0) - this.world.elevatorOpen) * Math.min(1, dt * 6);
+  }
+
+  liveFlags(floorLabel, userName) {
+    const desks = new Map();
+    let serverBusy = false, infoBusy = false;
+    for (const a of this.chars) {
+      if (!a.arrived || a.state !== 'working' || a.moving) continue;
+      if (a.room === 'dev' && a.spot && a.spot.desk) desks.set(a.spot.desk, true);
+      if (a.room === 'server') serverBusy = true;
+      if (a.room === 'info') infoBusy = true;
+    }
+    const c = this.claude;
+    return {
+      desks, serverBusy, infoBusy, floorLabel, userName,
+      owners: {
+        user: Date.now() < this.userTypingUntil,
+        claude: c.arrived && c.room === 'desk' && c.state === 'working',
+        phone: Date.now() < this.phoneUntil,
+      },
+    };
+  }
+}
+
+function todosOf(ev) {
+  if (ev.input && Array.isArray(ev.input.todos)) return ev.input.todos;
+  return null;
+}
+
+// ---------------------------------------------------------------- 앱
+
+const app = {
+  floors: [], user: 'me', floor: null, session: null, autoFollow: true,
+  town: null, world: null, cursor: null, sessionToken: 0, sessionActive: false,
+  cam: { x: 0, y: 0, scale: 1, dpr: 1, fitted: false }, showOld: false, showAllSessions: false,
+  title: '',
+};
+
+const canvas = $('#town');
+const ctx = canvas.getContext('2d');
+
+function resize() {
+  const r = canvas.parentElement.getBoundingClientRect();
+  app.cam.dpr = window.devicePixelRatio || 1;
+  canvas.width = Math.round(r.width * app.cam.dpr);
+  canvas.height = Math.round(r.height * app.cam.dpr);
+  canvas.style.width = r.width + 'px';
+  canvas.style.height = r.height + 'px';
+  if (!app.cam.touched) fit();
+}
+
+// 가장자리 숲은 조금 잘라도 되니, 방들이 있는 부분이 화면에 꽉 차게 맞춘다
+function fit() {
+  const w = canvas.width / app.cam.dpr, h = canvas.height / app.cam.dpr;
+  const minX = iso(1, GH - 1).x - 20, maxX = iso(GW - 1, 1).x + 20;
+  const minY = iso(1, 1).y - 110, maxY = iso(GW - 1, GH - 1).y + 40;
+  const s = Math.min(w / (maxX - minX), (h - 70) / (maxY - minY));
+  app.cam.scale = s;
+  app.cam.x = (w - (maxX - minX) * s) / 2 - minX * s;
+  app.cam.y = (h + 50 - (maxY - minY) * s) / 2 - minY * s;
+}
+
+function zoom(f, cx, cy) {
+  const cam = app.cam;
+  const w = canvas.width / cam.dpr, h = canvas.height / cam.dpr;
+  cx = cx == null ? w / 2 : cx; cy = cy == null ? h / 2 : cy;
+  const ns = Math.max(0.35, Math.min(3, cam.scale * f));
+  cam.x = cx - (cx - cam.x) * ns / cam.scale;
+  cam.y = cy - (cy - cam.y) * ns / cam.scale;
+  cam.scale = ns;
+  cam.touched = true;
+}
+
+(function setupCamera() {
+  let drag = null;
+  canvas.addEventListener('pointerdown', e => { drag = { x: e.clientX, y: e.clientY, cx: app.cam.x, cy: app.cam.y }; canvas.setPointerCapture(e.pointerId); });
+  canvas.addEventListener('pointermove', e => {
+    if (!drag) return;
+    app.cam.x = drag.cx + e.clientX - drag.x; app.cam.y = drag.cy + e.clientY - drag.y; app.cam.touched = true;
+  });
+  canvas.addEventListener('pointerup', () => { drag = null; });
+  canvas.addEventListener('wheel', e => {
+    e.preventDefault();
+    const r = canvas.getBoundingClientRect();
+    zoom(e.deltaY < 0 ? 1.1 : 1 / 1.1, e.clientX - r.left, e.clientY - r.top);
+  }, { passive: false });
+  $('#zoomIn').onclick = () => zoom(1.2);
+  $('#zoomOut').onclick = () => zoom(1 / 1.2);
+  $('#zoomFit').onclick = () => { app.cam.touched = false; fit(); };
+  window.addEventListener('resize', resize);
+})();
+
+// -------- 데이터
+
+async function getJson(url) {
+  const r = await fetch(url, { cache: 'no-store' });
+  if (!r.ok) throw new Error(r.status + ' ' + url);
+  return r.json();
+}
+
+async function refreshFloors() {
+  try {
+    const data = await getJson('/api/floors');
+    app.floors = data.floors;
+    app.user = data.user || 'me';
+    $('#rootPath').textContent = data.root + (data.demo ? ' (데모)' : '');
+    if (!app.floor && app.floors.length) {
+      const fromHash = new URLSearchParams(location.hash.slice(1));
+      const hf = app.floors.find(f => f.id === fromHash.get('floor'));
+      const latest = [...app.floors].sort((a, b) => b.lastActive - a.lastActive)[0];
+      const f = hf || latest;
+      const sid = hf && fromHash.get('session') && f.sessions.some(s => s.id === fromHash.get('session')) ? fromHash.get('session') : null;
+      if (sid) app.autoFollow = false;
+      await enterFloor(f, sid, false);
+    } else if (app.floor) {
+      const f = app.floors.find(x => x.id === app.floor.id);
+      if (f) {
+        app.floor = f;
+        // /clear 하면 같은 층의 새 세션으로 따라간다
+        const newest = [...f.sessions].sort((a, b) => b.birth - a.birth)[0];
+        const cur = f.sessions.find(s => s.id === app.session);
+        if (app.autoFollow && newest && newest.id !== app.session && (!cur || newest.birth > cur.birth)) {
+          toast(`🆕 ${f.floor}F 새 세션으로 따라갑니다`);
+          openSession(f, newest.id);
+        }
+      }
+    }
+    renderFloors();
+    renderHeader();
+    $('#empty').hidden = app.floors.length > 0;
+  } catch (e) {
+    console.warn(e);
+  }
+}
+
+async function enterFloor(f, sessionId, animate = true) {
+  const prev = app.floor ? app.floor.floor : 1;
+  if (sessionId === undefined || sessionId === null) app.autoFollow = true;
+  app.floor = f;
+  const sid = sessionId || (f.sessions[0] && f.sessions[0].id);
+  if (animate && prev !== f.floor) await elevatorRide(prev, f.floor);
+  openSession(f, sid);
+  renderFloors();
+}
+
+function elevatorRide(from, to) {
+  const el = $('#elevator');
+  const num = $('#elevatorNum');
+  const arrow = $('#elevatorArrow');
+  arrow.textContent = to > from ? '▲' : '▼';
+  el.hidden = false;
+  el.classList.add('show');
+  const steps = Math.abs(to - from);
+  const each = Math.max(45, Math.min(160, 900 / Math.max(1, steps)));
+  return new Promise(resolve => {
+    let cur = from;
+    num.textContent = cur + 'F';
+    const tick = () => {
+      if (cur === to) {
+        setTimeout(() => { el.classList.remove('show'); setTimeout(() => { el.hidden = true; }, 250); resolve(); }, 380);
+        return;
+      }
+      cur += to > from ? 1 : -1;
+      num.textContent = cur + 'F';
+      setTimeout(tick, each);
+    };
+    setTimeout(tick, each);
+  });
+}
+
+function openSession(f, sid) {
+  if (!sid) return;
+  app.session = sid;
+  app.cursor = null;
+  app.title = '';
+  const token = ++app.sessionToken;
+  const themeIndex = themeForFloor(f.floor);
+  if (!app.world || app.world.themeIndex !== themeIndex) app.world = buildWorld(themeIndex);
+  app.world.todos = [];
+  app.town = new Town(app.world, { userName: app.user, onTitle: t => { app.title = t; renderHeader(); } });
+  history.replaceState(null, '', `#floor=${encodeURIComponent(f.id)}${app.autoFollow ? '' : '&session=' + encodeURIComponent(sid)}`);
+  renderHeader();
+  poll(token, f.id, sid);
+}
+
+async function poll(token, floorId, sid) {
+  let first = true;
+  while (token === app.sessionToken) {
+    let data = null;
+    try {
+      const c = app.cursor ? '&c=' + encodeURIComponent(JSON.stringify(app.cursor)) : '';
+      data = await getJson(`/api/session?floor=${encodeURIComponent(floorId)}&session=${encodeURIComponent(sid)}${c}`);
+    } catch (e) {
+      await sleep(1000);
+      continue;
+    }
+    if (token !== app.sessionToken) return;
+    const town = app.town;
+    Object.assign(town.subsMeta, data.subs || {});
+    app.sessionActive = data.session.active;
+    if (data.reset) { openSession(app.floor, sid); return; }
+    if (first || data.initial) { town.replay(data.events, data.session.active); first = false; }
+    else for (const ev of data.events) town.handle(ev);
+    app.cursor = data.cursor;
+    renderHeader();
+    if (!data.session.more) await sleep(POLL_MS);
+  }
+}
+
+// -------- 화면 패널
+
+function renderHeader() {
+  const f = app.floor;
+  if (!f) return;
+  $('#floorBadge').textContent = f.floor + 'F';
+  $('#floorName').textContent = f.name;
+  const s = f.sessions.find(x => x.id === app.session);
+  $('#sessionTitle').textContent = app.title || (s ? s.title : '');
+  $('#themeLabel').textContent = THEMES[themeForFloor(f.floor)].label + ' 마을';
+  const live = $('#live');
+  live.classList.toggle('on', app.sessionActive);
+  live.lastChild.textContent = app.sessionActive ? 'LIVE' : '쉬는 중';
+  $('#cwd').textContent = f.cwd;
+  $('#sid').textContent = app.session ? app.session.slice(0, 8) : '';
+}
+
+function renderFloors() {
+  const box = $('#floors');
+  const now = Date.now();
+  const sorted = [...app.floors].sort((a, b) => b.floor - a.floor);
+  const recent = sorted.filter(f => f.active || now - f.lastActive < OLD_FLOOR_MS || (app.floor && f.id === app.floor.id));
+  const old = sorted.filter(f => !recent.includes(f));
+  const item = f => {
+    const cur = app.floor && f.id === app.floor.id;
+    let html = `<li class="floor ${cur ? 'current' : ''} ${f.active ? 'lit' : ''}" data-floor="${esc(f.id)}">
+      <div class="frow"><span class="fnum">${f.floor}F</span><span class="fname">${esc(f.name)}</span><span class="light" title="${f.active ? '지금 일하는 중' : '불 꺼짐'}"></span></div>
+      <div class="fmeta">세션 ${f.sessionCount}개 · ${ago(now - f.lastActive)}</div>`;
+    if (cur) {
+      const list = app.showAllSessions ? f.sessions : f.sessions.slice(0, 8);
+      html += `<ul class="sessions">
+        <li class="follow ${app.autoFollow ? 'on' : ''}" data-follow="1">${app.autoFollow ? '✅' : '⬜'} 최근 세션 자동으로 따라가기</li>
+        ${list.map(s => `<li class="sess ${s.id === app.session ? 'sel' : ''} ${s.active ? 'act' : ''}" data-session="${esc(s.id)}">
+          <span class="stitle">${esc(s.title)}</span><span class="sago">${ago(now - s.mtime)}</span></li>`).join('')}
+        ${f.sessions.length > 8 ? `<li class="more" data-more="1">${app.showAllSessions ? '접기' : `세션 ${f.sessions.length - 8}개 더 보기`}</li>` : ''}
+      </ul>`;
+    }
+    return html + '</li>';
+  };
+  box.innerHTML = recent.map(item).join('') +
+    (old.length ? `<li class="oldtoggle" data-old="1">${app.showOld ? '▾' : '▸'} 불 꺼진 지 오래된 층 ${old.length}개</li>` + (app.showOld ? old.map(item).join('') : '') : '');
+}
+
+$('#floors').addEventListener('click', e => {
+  const t = e.target.closest('[data-session],[data-follow],[data-more],[data-old],[data-floor]');
+  if (!t) return;
+  e.stopPropagation();
+  if (t.dataset.old) { app.showOld = !app.showOld; return renderFloors(); }
+  if (t.dataset.more) { app.showAllSessions = !app.showAllSessions; return renderFloors(); }
+  if (t.dataset.follow) {
+    app.autoFollow = !app.autoFollow;
+    if (app.autoFollow && app.floor.sessions[0] && app.floor.sessions[0].id !== app.session) openSession(app.floor, app.floor.sessions[0].id);
+    return renderFloors();
+  }
+  if (t.dataset.session) {
+    if (t.dataset.session === app.session) return;
+    app.autoFollow = false;
+    openSession(app.floor, t.dataset.session);
+    return renderFloors();
+  }
+  const f = app.floors.find(x => x.id === t.dataset.floor);
+  if (f && (!app.floor || f.id !== app.floor.id)) { app.showAllSessions = false; enterFloor(f, null, true); }
+});
+
+const STATE_LABEL = { working: '작업 중', idle: '대기', arriving: '출근 중', reporting: '보고 중', leaving: '퇴근 중' };
+
+function renderPeople() {
+  const town = app.town;
+  if (!town) return;
+  const now = Date.now();
+  const people = town.chars.filter(c => c.kind !== 'user' && !c.hidden || c.kind === 'sub');
+  $('#peopleCount').textContent = `${people.length}명 근무 중`;
+  $('#people').innerHTML = people.map(a => {
+    let st = STATE_LABEL[a.state] || a.state;
+    if (a.emote === 'ponder') st = '고민 중';
+    if (a.emote === 'sleep') st = '졸음';
+    if (a.sweat) st = '진땀';
+    const sp = SPECIES[a.species];
+    return `<li class="person">
+      <span class="avatar" style="background:${a.color}">${a.kind === 'claude' ? 'C' : esc((a.type || '?')[0].toUpperCase())}</span>
+      <div class="pbody">
+        <div class="prow"><b>${esc(a.kind === 'claude' ? 'Claude' : a.type)}</b><span class="species">${esc(sp ? sp.name : '')}</span><span class="pill s-${esc(a.state)} ${a.sweat ? 'err' : ''}">${esc(st)}</span></div>
+        ${a.desc ? `<div class="pdesc">${esc(a.desc)}</div>` : ''}
+        <div class="pact">${esc(a.activity)}</div>
+        <div class="pmeta">도구 ${a.tools}회 · ${dur(now - a.since)}</div>
+      </div></li>`;
+  }).join('');
+}
+
+function renderLogs() {
+  const town = app.town;
+  if (!town || !town.dirty) return;
+  town.dirty = false;
+  $('#logs').innerHTML = town.logs.slice(0, 80).map(l => `<li class="${l.err ? 'err' : ''}">
+    <span class="ltime">${clock(l.t)}</span><span class="lwho" style="color:${l.color}">● ${esc(l.who)}</span>
+    <span class="ltext">${esc(l.text)}</span></li>`).join('');
+}
+
+function renderLegend() {
+  const rooms = ['library', 'dev', 'server', 'info', 'meeting', 'lobby', 'elevator'];
+  $('#legend').innerHTML = rooms.map(k => `<li><span>${ROOMS[k].icon}</span><b>${ROOMS[k].name}</b><em>${ROOMS[k].desc}</em></li>`).join('') +
+    `<li class="cast"><span>🟣</span><b>메타몽</b><em>Claude</em></li>
+     <li class="cast"><span>🌱</span><b>이상해씨</b><em>Explore · 모자</em></li>
+     <li class="cast"><span>👻</span><b>팬텀</b><em>Plan · 안경</em></li>
+     <li class="cast"><span>⚡</span><b>피카츄</b><em>범용 에이전트</em></li>
+     <li class="cast"><span>🦊</span><b>이브이</b><em>그 밖의 에이전트</em></li>`;
+}
+
+let toastTimer = null;
+function toast(msg) {
+  const el = $('#toast');
+  el.textContent = msg; el.classList.add('show');
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => el.classList.remove('show'), 2600);
+}
+
+// -------- 루프
+
+let last = performance.now();
+let panelAt = 0;
+function frame(now) {
+  const dt = Math.min(0.1, (now - last) / 1000);
+  last = now;
+  if (app.town && app.world) {
+    app.town.update(dt, app.sessionActive);
+    const live = app.town.liveFlags(app.floor ? app.floor.floor + 'F' : '', app.user);
+    render(ctx, app.world, app.cam, app.town.chars, live, now / 1000);
+    if (now - panelAt > 500) { panelAt = now; renderPeople(); renderLogs(); }
+  } else {
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.fillStyle = '#d9f1ff'; ctx.fillRect(0, 0, canvas.width, canvas.height);
+  }
+  requestAnimationFrame(frame);
+}
+
+resize();
+renderLegend();
+refreshFloors();
+setInterval(refreshFloors, FLOORS_MS);
+setInterval(() => renderFloors(), 15000);
+requestAnimationFrame(frame);
