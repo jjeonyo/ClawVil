@@ -524,6 +524,47 @@ function sparkles(ctx, x, y, t) {
   }
 }
 
+// 오류·확인 필요 표시: 발밑에 퍼지는 고리와 머리 옆에 뜨는 표지판
+const ALERT = {
+  error: { ring: '255,59,71', fill: '#e8323d', line: '#8f1820', mark: '!' },
+  attention: { ring: '255,178,26', fill: '#ffb21a', line: '#8a5200', mark: '?' },
+};
+
+function alertRing(ctx, kind, w, t) {
+  const a = ALERT[kind];
+  ctx.save(); ctx.scale(1, 0.38);
+  for (let i = 0; i < 2; i++) {
+    const p = (t * 0.9 + i * 0.5) % 1;
+    const r = 12 * w + p * 14 * w;
+    ctx.strokeStyle = `rgba(${a.ring},${(1 - p) * 0.85})`; ctx.lineWidth = 3.2;
+    ctx.beginPath(); ctx.arc(0, 0, r, 0, TAU); ctx.stroke();
+  }
+  const g = ctx.createRadialGradient(0, 0, 0, 0, 0, 16 * w);
+  g.addColorStop(0, `rgba(${a.ring},.5)`); g.addColorStop(1, `rgba(${a.ring},0)`);
+  ctx.fillStyle = g; ctx.beginPath(); ctx.arc(0, 0, 16 * w, 0, TAU); ctx.fill();
+  // 밝은 바닥에서도 보이도록 가운데 고리는 진한 테두리를 두른다
+  ctx.lineWidth = 4.5; ctx.strokeStyle = a.line; ctx.globalAlpha *= 0.55;
+  ctx.beginPath(); ctx.arc(0, 0, 12 * w, 0, TAU); ctx.stroke();
+  ctx.lineWidth = 2.6; ctx.strokeStyle = a.fill; ctx.globalAlpha /= 0.55;
+  ctx.beginPath(); ctx.arc(0, 0, 12 * w, 0, TAU); ctx.stroke();
+  ctx.restore();
+}
+
+function alertMark(ctx, kind, x, y, t) {
+  const a = ALERT[kind];
+  const bob = Math.abs(Math.sin(t * 5)) * 2.5;
+  ctx.save(); ctx.translate(x, y - bob);
+  // 둥근 마름모 표지판
+  ctx.beginPath(); ctx.moveTo(0, -9); ctx.quadraticCurveTo(1.2, -8.2, 8, -1.2); ctx.quadraticCurveTo(9, 0, 8, 1.2);
+  ctx.quadraticCurveTo(1.2, 8.2, 0, 9); ctx.quadraticCurveTo(-1.2, 8.2, -8, 1.2); ctx.quadraticCurveTo(-9, 0, -8, -1.2);
+  ctx.quadraticCurveTo(-1.2, -8.2, 0, -9); ctx.closePath();
+  ctx.fillStyle = a.fill; ctx.fill(); ctx.strokeStyle = '#ffffff'; ctx.lineWidth = 2.2; ctx.stroke();
+  ctx.strokeStyle = a.line; ctx.lineWidth = 0.9; ctx.stroke();
+  ctx.fillStyle = '#ffffff'; ctx.font = 'bold 11px "Jua", sans-serif'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.fillText(a.mark, 0, 0.8);
+  ctx.restore();
+}
+
 // 엘리베이터에서 나타나고 사라질 때 피어오르는 연기
 function poof(ctx, p) {
   ctx.save();
@@ -560,6 +601,8 @@ export function drawCharacter(ctx, ch, t) {
   ctx.translate(ch.sx, ch.sy);
   ctx.scale(CHAR_SCALE, CHAR_SCALE);
   ctx.globalAlpha = alpha;
+  const alert = ch.alert;
+  if (alert) alertRing(ctx, alert, sp.w || 1, t);
   if (sp.w !== 0) {
     const g = ctx.createRadialGradient(0, 0, 0, 0, 0, 14 * (sp.w || 1));
     g.addColorStop(0, 'rgba(40,50,20,.28)'); g.addColorStop(1, 'rgba(40,50,20,0)');
@@ -581,6 +624,7 @@ export function drawCharacter(ctx, ch, t) {
   if (ch.emote === 'wave') hand(ctx, 17 * facing, headY + 12, t, sp.color);
   if (ch.eyes === 'happy') sparkles(ctx, 0, headY + 6, t);
   if (ch.sweat) sweat(ctx, -10 * facing, headY + 8, t);
+  if (alert) alertMark(ctx, alert, 15 * facing, top + 2, t);
   if (ch.poofT != null) {
     const p = (t - ch.poofT) / 0.7;
     if (p >= 0 && p < 1) poof(ctx, p);

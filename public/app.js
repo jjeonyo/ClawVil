@@ -82,6 +82,8 @@ const WAIT_MS = 30 * 60e3;
 
 const CLAUDE_PROPS = { library: 'glasses', dev: 'hardhat', server: 'headset', info: 'antenna', meeting: 'beret' };
 
+const ALERT_BUBBLES = new Set(['err', 'ask', 'wait']);
+const ERR_HOLD_MS = 2500;   // 오류 말풍선이 다른 말풍선에 가리지 않고 버티는 최소 시간
 const LONG_TOOLS = new Set(['Bash', 'BashOutput', 'Monitor', 'PowerShell', 'TaskOutput', 'Task', 'Agent', 'WebFetch', 'WebSearch', 'AskUserQuestion', 'SendMessage']);
 
 // ---------------------------------------------------------------- 캐릭터
@@ -89,14 +91,33 @@ const LONG_TOOLS = new Set(['Bash', 'BashOutput', 'Monitor', 'PowerShell', 'Task
 class Agent {
   constructor(o) {
     Object.assign(this, {
-      x: 0, y: 0, path: [], speed: 3.4, facing: 1, bubble: null, emote: null, sweatUntil: 0,
+      x: 0, y: 0, path: [], speed: 3.4, facing: 1, bubble: null, queued: null, emote: null, sweatUntil: 0,
       state: 'idle', activity: '대기 중', tools: 0, since: Date.now(), lastAt: Date.now(),
       seed: Math.random() * 10, alpha: 1, hidden: false, token: 0, spot: null, mouth: null,
     }, o);
   }
   get moving() { return this.path.length > 0; }
   get sweat() { return Date.now() < this.sweatUntil; }
-  say(type, text, ms = 3500) { this.bubble = { type, text, until: ms ? Date.now() + ms : Infinity }; }
+  // 눈에 띄게 표시할 상태: 'error'(실패·오류) · 'attention'(질문·승인 대기) · null
+  get alert() {
+    const t = this.bubble && this.bubble.type;
+    if (this.sweat || t === 'err') return 'error';
+    return t === 'ask' || t === 'wait' ? 'attention' : null;
+  }
+  say(type, text, ms = 3500) {
+    const now = Date.now();
+    const b = { type, text, born: now, until: ms ? now + ms : Infinity };
+    // 막 뜬 오류 말풍선은 평범한 말풍선에 바로 가리지 않는다. 그 말풍선은 update()에서 뒤이어 띄운다
+    const cur = this.bubble;
+    if (cur && cur.type === 'err' && !ALERT_BUBBLES.has(type) && now - cur.born < ERR_HOLD_MS) { this.queued = b; return; }
+    this.queued = null;
+    this.bubble = b;
+  }
+  // 조건에 맞는 말풍선을 지운다 (뒤이어 띄우려고 미뤄 둔 것도)
+  unsay(test = () => true) {
+    if (this.bubble && test(this.bubble)) this.bubble = null;
+    if (this.queued && test(this.queued)) this.queued = null;
+  }
 }
 
 // ---------------------------------------------------------------- 마을(한 세션)
@@ -202,7 +223,7 @@ class Town {
   // -------- 로그
 
   log(who, text, opts = {}) {
-    this.logs.unshift({ t: opts.t || Date.now(), who: who.label || who, color: who.color || '#888', text, err: !!opts.err });
+    this.logs.unshift({ t: opts.t || Date.now(), who: who.label || who, color: who.color || '#888', text, err: !!opts.err, warn: !!opts.warn });
     if (this.logs.length > 120) this.logs.length = 120;
     this.dirty = true;
   }
@@ -300,7 +321,7 @@ class Town {
     a.tools++; a.state = 'working'; a.activity = what; a.thinkingSince = null; a.emote = null; a.mouth = null;
     if (a === this.claude) this.turnActive = true;
     this.pending.set(ev.id, { agent: a, ev, at: now });
-    this.log(a, what, { t: ev.t });
+    this.log(a, what, { t: ev.t, warn: name === 'AskUserQuestion' });
 
     if ((name === 'Task' || name === 'Agent') && a === this.claude) {
       // 자기 자리에서 전화를 걸고, 새 에이전트가 엘리베이터로 출근한다
@@ -333,7 +354,7 @@ class Town {
     if (!p) return;
     this.pending.delete(ev.id);
     const a = p.agent;
-    if (a.bubble && (a.bubble.type === 'say' || a.bubble.type === 'ask') && a.bubble.until === Infinity) a.bubble = null;
+    a.unsay(b => ['say', 'ask', 'wait'].includes(b.type) && b.until === Infinity);
     if (a.emote === 'read' || a.emote === 'phone') a.emote = null;
     if (ev.err) {
       a.sweatUntil = Date.now() + 4500;
@@ -384,7 +405,7 @@ class Town {
   finishSub(a, ev) {
     for (const [id, p] of this.pending) if (p.agent === a) this.pending.delete(id);
     if (this.replaying) { this.removeSub(a); return; }
-    a.state = 'reporting'; a.activity = '보고하러 가는 중'; a.emote = null; a.bubble = null;
+    a.state = 'reporting'; a.activity = '보고하러 가는 중'; a.emote = null; a.unsay();
     const spot = this.spotNearClaude(a);
     this.release(a);
     a.spot = spot; this.reserved.set(spot, a); a.room = 'report';
@@ -430,7 +451,7 @@ class Town {
     c.state = 'idle'; c.activity = '대기 중'; c.emote = null; c.mouth = null; c.since = Date.now();
     if (msg) { c.say('say', msg, 2500); this.log(c, msg, { t }); }
     else if (!quiet) this.cheer();
-    if (c.bubble && c.bubble.until === Infinity) c.bubble = null;
+    c.unsay(b => b.until === Infinity);
     this.goRoom(c, 'desk');
   }
 
@@ -447,7 +468,8 @@ class Town {
     this.replaying = true;
     for (const ev of events) this.handle(ev);
     this.replaying = false;
-    for (const ch of this.chars) ch.bubble = null;
+    // 지난 실패의 진땀·오류 표시는 재생한 시각 기준이라 남기지 않는다
+    for (const ch of this.chars) { ch.unsay(); ch.sweatUntil = 0; }
     const quietFor = Date.now() - (this.lastEventAt || 0);
     if (!((sessionActive && quietFor <= 10 * 60e3) || this.waiting())) {
       for (const a of [...this.subs.values()]) this.removeSub(a);
@@ -490,6 +512,13 @@ class Town {
         if (dist <= step) { a.x = p.x; a.y = p.y; a.path.shift(); if (!a.path.length && a.onArrive) a.onArrive(); }
         else { a.x += dx / dist * step; a.y += dy / dist * step; }
       }
+      if (a.queued && (!a.bubble || now - a.bubble.born >= ERR_HOLD_MS)) {
+        const q = a.queued;
+        a.queued = null;
+        if (q.until !== Infinity) q.until += now - q.born;
+        q.born = now;
+        a.bubble = q;
+      }
       if (a.bubble && now > a.bubble.until) a.bubble = null;
     }
     const c = this.claude;
@@ -503,7 +532,11 @@ class Town {
       }
       for (const p of this.pending.values()) {
         if (p.agent !== c || LONG_TOOLS.has(p.ev.name) || /^mcp__/.test(p.ev.name) || p.asked) continue;
-        if (now - p.at > 7000 && live) { p.asked = true; c.say('ask', '⏳ 승인 기다리는 중일까요?', 0); }
+        if (now - p.at > 7000 && live) {
+          p.asked = true;
+          c.say('wait', '승인 기다리는 중일까요?', 0);
+          this.log(c, `⏳ 승인 대기 중인 것 같아요: ${p.ev.name}`, { warn: true });
+        }
       }
     }
     if (c.state === 'idle' && !c.moving) c.emote = now - c.since > 3 * 60e3 ? 'sleep' : (c.emote === 'sleep' ? null : c.emote);
@@ -865,12 +898,14 @@ function renderPeople() {
     let st = STATE_LABEL[a.state] || a.state;
     if (a.emote === 'ponder') st = '고민 중';
     if (a.emote === 'sleep') st = '졸음';
-    if (a.sweat) st = '진땀';
+    const al = a.alert;
+    if (al === 'error') st = '⚠ 오류';
+    else if (al === 'attention') st = a.bubble.type === 'wait' ? '⏳ 승인 대기?' : '❓ 답변 기다림';
     const sp = SPECIES[a.species];
-    return `<li class="person">
+    return `<li class="person ${al ? 'alert-' + al : ''}">
       <span class="avatar" style="border-color:${a.color}"><img src="${portraitUrl(a.species)}" alt=""></span>
       <div class="pbody">
-        <div class="prow"><b>${esc(a.kind === 'claude' ? 'Claude' : a.type)}</b><span class="species">${esc(sp ? sp.name : '')}</span><span class="pill s-${esc(a.state)} ${a.sweat ? 'err' : ''}">${esc(st)}</span></div>
+        <div class="prow"><b>${esc(a.kind === 'claude' ? 'Claude' : a.type)}</b><span class="species">${esc(sp ? sp.name : '')}</span><span class="pill s-${esc(a.state)} ${al ? 'a-' + al : ''}">${esc(st)}</span></div>
         ${a.desc ? `<div class="pdesc">${esc(a.desc)}</div>` : ''}
         <div class="pact">${esc(a.activity)}</div>
         <div class="pmeta">도구 ${a.tools}회 · ${dur(now - a.since)}</div>
@@ -882,9 +917,28 @@ function renderLogs() {
   const town = app.town;
   if (!town || !town.dirty) return;
   town.dirty = false;
-  $('#logs').innerHTML = town.logs.slice(0, 80).map(l => `<li class="${l.err ? 'err' : ''}">
+  $('#logs').innerHTML = town.logs.slice(0, 80).map(l => `<li class="${l.err ? 'err' : l.warn ? 'warn' : ''}">
     <span class="ltime">${clock(l.t)}</span><span class="lwho" style="color:${l.color}">● ${esc(l.who)}</span>
     <span class="ltext">${esc(l.text)}</span></li>`).join('');
+}
+
+// 오류나 확인할 일이 있으면 상단 표지, 무대 테두리, 브라우저 탭 제목으로도 알린다
+const BASE_TITLE = document.title;
+function renderAlerts() {
+  const people = app.town ? app.town.chars.filter(c => c.kind === 'claude' || c.kind === 'sub') : [];
+  const err = people.filter(c => c.alert === 'error').length;
+  const att = people.filter(c => c.alert === 'attention').length;
+  const box = $('#alerts');
+  const key = err + '/' + att;
+  if (box.dataset.key !== key) {
+    box.dataset.key = key;
+    box.innerHTML = (err ? `<span class="chip err">⚠ 오류 ${err}</span>` : '') + (att ? `<span class="chip warn">❓ 확인 필요 ${att}</span>` : '');
+  }
+  const stage = $('#stage');
+  stage.classList.toggle('alert-error', err > 0);
+  stage.classList.toggle('alert-attention', !err && att > 0);
+  const title = (err ? '⚠ ' : att ? '❓ ' : '') + BASE_TITLE;
+  if (document.title !== title) document.title = title;
 }
 
 function renderLegend() {
@@ -914,7 +968,7 @@ function frame(now) {
     app.town.update(dt, app.sessionActive);
     const live = app.town.liveFlags(app.floor ? app.floor.floor + 'F' : '', app.user);
     render(ctx, app.world, app.cam, app.town.chars, live, now / 1000);
-    if (now - panelAt > 500) { panelAt = now; renderPeople(); renderLogs(); }
+    if (now - panelAt > 500) { panelAt = now; renderPeople(); renderLogs(); renderAlerts(); }
   } else {
     ctx.setTransform(1, 0, 0, 1, 0, 0);
     ctx.fillStyle = '#d9f1ff'; ctx.fillRect(0, 0, canvas.width, canvas.height);
