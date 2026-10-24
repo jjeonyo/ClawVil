@@ -41,7 +41,7 @@ function roomForTool(name) {
     case 'TodoWrite': case 'TaskCreate': case 'TaskUpdate': case 'TaskList': case 'TaskGet': case 'TaskOutput':
     case 'EnterPlanMode': case 'ExitPlanMode': case 'Skill': return 'meeting';
     case 'AskUserQuestion': return 'ask';
-    case 'Task': case 'Agent': case 'SendMessage': return 'desk';
+    case 'Task': case 'Agent': case 'SendMessage': case 'Workflow': return 'desk';
     default: return 'dev';
   }
 }
@@ -70,13 +70,18 @@ function describeTool(name, i = {}) {
     case 'AskUserQuestion': return `❓ ${short(i.question || '확인할 게 있어요', 60)}`;
     case 'Task': case 'Agent': return `📞 ${i.subagent_type || '도우미'} 호출 · ${short(i.description, 24)}`;
     case 'SendMessage': return `📞 ${i.to || '동료'}에게 연락`;
+    case 'Workflow': return '📞 워크플로 팀 호출';
+    case 'StructuredOutput': case 'SubagentHandback': return '📋 결과 정리 중';
     default:
       if (/^mcp__/.test(name)) return `🔌 ${name.split('__').slice(1).join(' · ')}`;
       return `🔧 ${name}`;
   }
 }
 
+// 서브에이전트가 결과를 넘기는 마지막 도구. 끝을 알리는 호출 결과가 따로 없는 서브에이전트(백그라운드·워크플로)는 이걸로 끝을 안다
+const FINAL_TOOLS = new Set(['StructuredOutput', 'SubagentHandback']);
 const RESUMED_QUIET_MS = 30000;   // 다시 일하러 간 서브에이전트가 이만큼 조용하면 끝난 것으로 본다
+const WF_QUIET_MS = 5 * 60e3;     // 워크플로 에이전트는 이만큼 조용해야 끝난 것으로 본다
 // Claude Code는 명령이 도는 동안 기록을 쓰지 않는다. 끝나지 않은 도구가 있으면 이 시간까지는 일하는 중으로 본다.
 const WAIT_MS = 30 * 60e3;
 
@@ -257,6 +262,16 @@ class Town {
 
   linkSub(key, ev) {
     const meta = this.subsMeta[key] || {};
+    if (meta.wf) {
+      // 워크플로가 띄운 에이전트: 따로 부른 호출이 없으니 기록만 보고 데려온다. 끝은 마지막 보고(FINAL_TOOLS)나
+      // 마지막 답변, 또는 한동안 조용한 것으로 판단한다 (updateSubs)
+      const w = this.spawnSub({ id: 'file:' + key, t: ev && ev.t, input: { subagent_type: '워크플로', description: meta.desc || short(meta.prompt, 20), prompt: meta.prompt } }, this.replaying);
+      w.resumed = true; w.wf = true;
+      if (meta.agentId) w.agentId = meta.agentId;
+      w.fileKey = key;
+      this.subByFile.set(key, w);
+      return w;
+    }
     const norm = s => String(s || '').replace(/\s+/g, ' ').trim().slice(0, 80);
     const cands = [...this.subs.values()].filter(s => !s.fileKey && !s.gone);
     let a = cands.find(s => meta.agentId && s.agentId === meta.agentId)
@@ -281,17 +296,15 @@ class Town {
     const a = this.actorFor(ev);
     if (!a || a.gone) return;
     a.lastAt = now;
-    if (a === this.claude && (ev.k === 'think' || ev.k === 'text' || ev.k === 'tool')) {
-      // Claude는 도구 결과를 모두 받아야 다음 응답을 시작한다. 그런데도 남아 있는 이전 응답의 도구는
+    if (a === this.claude && ev.mid && !ev.side && (ev.k === 'think' || ev.k === 'text' || ev.k === 'tool')) {
+      // Claude는 도구 결과를 모두 받아야 다음 응답을 시작한다. 그런데도 남아 있는 이전 응답(다른 mid)의 도구는
       // 결과 줄이 빠진 것(4MB 넘는 줄 등)이니 끝난 것으로 정리한다. 서브에이전트 호출은 따로 끝을 판단한다.
-      // 응답 ID(mid)가 있으면 그것으로, 없으면 '도구 결과가 온 뒤 처음 나온 기록'으로 새 응답을 가린다
+      // 같은 응답 안에서는 도구 실행이 겹쳐 결과가 먼저 기록되기도 하므로 응답 ID가 있을 때만 정리한다
       for (const [id, p] of this.pending) {
-        if (p.agent !== a || p.ev.name === 'Task' || p.ev.name === 'Agent') continue;
-        if (!(p.ev.mid && ev.mid ? p.ev.mid !== ev.mid : this.claudeStepDone)) continue;
+        if (p.agent !== a || !p.ev.mid || p.ev.mid === ev.mid || p.ev.name === 'Task' || p.ev.name === 'Agent') continue;
         this.pending.delete(id);
         a.unsay(b => b.tool === id);
       }
-      this.claudeStepDone = false;
     }
     if (a.kind === 'sub' && (a.state === 'reporting' || a.state === 'leaving') && (ev.k === 'tool' || ev.k === 'think')) {
       // 보고하러 가다가 일을 하나 더 받으면 다시 일하러 돌아간다. 이때는 끝났다는 신호(Task 결과)가 다시 오지 않으므로
@@ -317,7 +330,8 @@ class Town {
       }
       case 'interrupt': this.endTurn('⛔ 중단됨', ev.t); break;
       case 'think': {
-        a.state = 'working'; a.thinkingSince = now; a.emote = null;
+        if (a.state !== 'arriving') a.state = 'working';
+        a.thinkingSince = now; a.emote = null;
         a.say('think', ev.text || '생각 중…', 7000);
         if (ev.text) this.log(a, '💭 ' + ev.text, { t: ev.t });
         break;
@@ -325,7 +339,12 @@ class Town {
       case 'tool': this.onTool(a, ev); break;
       case 'result': this.onResult(ev); break;
       case 'text': {
-        if (a.kind === 'sub') { a.say('say', ev.text, 3000); break; }
+        if (a.kind === 'sub') {
+          a.say('say', ev.text, 3000);
+          // 끝을 알리는 호출 결과가 없는 서브에이전트는 마지막 답변으로 끝난 것을 안다
+          if (a.resumed && ev.stop === 'end_turn') { a.resumed = false; this.finishSub(a, { text: ev.text, err: false }); }
+          break;
+        }
         a.say('say', ev.text, 6000);
         this.log(a, '💬 ' + ev.text, { t: ev.t });
         if (ev.stop === 'end_turn') this.endTurn(null, ev.t);
@@ -342,10 +361,24 @@ class Town {
     const name = ev.name;
     const room = roomForTool(name);
     const what = describeTool(name, ev.input);
-    a.tools++; a.state = 'working'; a.activity = what; a.thinkingSince = null; a.emote = null; a.mouth = null;
+    const arriving = a.state === 'arriving';
+    a.tools++; a.state = arriving ? 'arriving' : 'working'; a.activity = what; a.thinkingSince = null; a.emote = null; a.mouth = null;
     if (a === this.claude) this.turnActive = true;
     this.pending.set(ev.id, { agent: a, ev, at: now });
     this.log(a, what, { t: ev.t, warn: name === 'AskUserQuestion' });
+    if (arriving) {
+      // 아직 엘리베이터에서 내리기 전이면 내린 뒤 이 방으로 간다
+      a.nextRoom = room;
+      a.say('say', what, 0, ev.id);
+      return;
+    }
+    if (a.kind === 'sub' && FINAL_TOOLS.has(name)) { a.say('say', what, 0, ev.id); return; }
+    if (name === 'Workflow' && a === this.claude) {
+      // 워크플로도 자리에서 전화를 건다. 일할 에이전트들은 각자 기록이 생기면 엘리베이터로 출근한다
+      this.goRoom(a, 'desk', () => { a.emote = 'phone'; this.phoneUntil = Date.now() + 2600; });
+      a.say('call', '📞 워크플로 팀, 부탁해요', 3200);
+      return;
+    }
 
     if ((name === 'Task' || name === 'Agent') && a === this.claude) {
       // 자기 자리에서 전화를 걸고, 새 에이전트가 엘리베이터로 출근한다
@@ -378,7 +411,6 @@ class Town {
     if (!p) return;
     this.pending.delete(ev.id);
     const a = p.agent;
-    if (a === this.claude) this.claudeStepDone = true;
     a.unsay(b => b.until === Infinity && b.tool === ev.id);
     if (a.emote === 'read' || a.emote === 'phone') a.emote = null;
     if (ev.err) {
@@ -390,6 +422,9 @@ class Town {
     } else if (p.ev.name === 'AskUserQuestion') {
       this.user.say('say', ev.text || '응!', 3000);
       this.log(this.user, '🙋 ' + (ev.text || '답변'), { t: ev.t });
+    } else if (a.kind === 'sub' && a.resumed && FINAL_TOOLS.has(p.ev.name)) {
+      a.resumed = false;
+      this.finishSub(a, { text: '', err: false });
     }
   }
 
@@ -421,7 +456,12 @@ class Town {
       this.later(450, null, () => {
         a.alpha = 1;
         this.later(1400, null, () => { if (a.eyes === 'happy') a.eyes = null; });
-        if (a.state === 'arriving') { a.state = 'working'; a.activity = '일하러 가는 중'; this.goRoom(a, room, () => { if (room === 'library') a.emote = 'read'; }); }
+        if (a.state === 'arriving') {
+          const to = a.nextRoom || room;
+          a.state = 'working';
+          if (!a.nextRoom) a.activity = '일하러 가는 중';
+          this.goRoom(a, to, () => { if (to === 'library') a.emote = 'read'; });
+        }
       });
     });
     return a;
@@ -429,7 +469,8 @@ class Town {
 
   finishSub(a, ev) {
     for (const [id, p] of this.pending) if (p.agent === a) this.pending.delete(id);
-    if (this.replaying) { this.removeSub(a); return; }
+    // 재생 중이거나, 엘리베이터에서 내리기도 전에 끝났으면 그냥 보낸다
+    if (this.replaying || a.state === 'arriving') { this.removeSub(a); return; }
     a.state = 'reporting'; a.activity = '보고하러 가는 중'; a.emote = null;
     a.unsay(b => !(b.type === 'err' && Date.now() - b.born < ERR_HOLD_MS));   // 막 뜬 오류 말풍선은 남긴다
     const spot = this.spotNearClaude(a);
@@ -472,7 +513,6 @@ class Town {
 
   endTurn(msg, t, quiet = false) {
     this.turnActive = false;
-    this.claudeStepDone = false;
     for (const [id, p] of this.pending) if (p.agent === this.claude) this.pending.delete(id);
     const c = this.claude;
     c.state = 'idle'; c.activity = '대기 중'; c.emote = null; c.mouth = null; c.since = Date.now();
@@ -586,7 +626,9 @@ class Town {
       const busy = [...this.pending.values()].some(p => p.agent === a);
       const quiet = now - a.lastAt;
       // 끝나지 않은 도구가 있어도 결과가 끝내 안 오면(4MB 넘는 줄, 도중에 끈 경우) WAIT_MS 뒤에는 끝난 것으로 본다
-      if (busy ? quiet > WAIT_MS : (quiet > RESUMED_QUIET_MS || !live)) { a.resumed = false; this.finishSub(a, { text: '', err: false }); }
+      // 워크플로 에이전트는 끝을 알리는 마지막 보고가 있으니 생각이 길어져 조용한 것을 끝으로 오해하지 않게 더 기다린다
+      const quietMs = a.wf ? WF_QUIET_MS : RESUMED_QUIET_MS;
+      if (busy ? quiet > WAIT_MS : (quiet > quietMs || !live)) { a.resumed = false; this.finishSub(a, { text: '', err: false }); }
     }
   }
 
@@ -647,7 +689,9 @@ const canvas = $('#town');
 const ctx = canvas.getContext('2d');
 
 function resize() {
-  const r = canvas.parentElement.getBoundingClientRect();
+  // 무대 테두리 안쪽 크기 (getBoundingClientRect는 테두리까지 재서 오른쪽·아래가 몇 px 가려진다)
+  const st = canvas.parentElement;
+  const r = { width: st.clientWidth, height: st.clientHeight };
   app.cam.dpr = window.devicePixelRatio || 1;
   canvas.width = Math.round(r.width * app.cam.dpr);
   canvas.height = Math.round(r.height * app.cam.dpr);

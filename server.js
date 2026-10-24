@@ -213,16 +213,34 @@ function sessionInfo(file, st) {
   return info;
 }
 
+// 세션 폴더의 서브에이전트 기록 파일들. 워크플로가 띄운 에이전트는 subagents/workflows/<실행 ID>/agent-*.jsonl 에 있다
+function subagentFiles(floorDir, sessionId) {
+  const out = [];
+  const dir = path.join(floorDir, sessionId, 'subagents');
+  try {
+    for (const f of fs.readdirSync(dir)) {
+      if (f.endsWith('.jsonl') && NAME_RE.test(f)) out.push({ name: f, file: path.join(dir, f), wf: null });
+    }
+  } catch { /* 하위 폴더 없음 */ }
+  try {
+    for (const wf of fs.readdirSync(path.join(dir, 'workflows'))) {
+      if (!NAME_RE.test(wf)) continue;
+      try {
+        for (const f of fs.readdirSync(path.join(dir, 'workflows', wf))) {
+          if (f.startsWith('agent-') && f.endsWith('.jsonl') && NAME_RE.test(f)) out.push({ name: f, file: path.join(dir, 'workflows', wf, f), wf });
+        }
+      } catch { /* 폴더가 아님 */ }
+    }
+  } catch { /* 워크플로 없음 */ }
+  return out;
+}
+
 // 세션의 서브에이전트 기록 가운데 가장 최근에 바뀐 시각. 서브에이전트만 일하는 동안에도 불이 켜져 있게 한다.
 function newestSubagentWrite(floorDir, sessionId, oldFormat) {
   let newest = 0;
-  try {
-    const dir = path.join(floorDir, sessionId, 'subagents');
-    for (const f of fs.readdirSync(dir)) {
-      if (!f.endsWith('.jsonl')) continue;
-      try { newest = Math.max(newest, fs.statSync(path.join(dir, f)).mtimeMs); } catch { /* 지워짐 */ }
-    }
-  } catch { /* 하위 폴더 없음 */ }
+  for (const s of subagentFiles(floorDir, sessionId)) {
+    try { newest = Math.max(newest, fs.statSync(s.file).mtimeMs); } catch { /* 지워짐 */ }
+  }
   return Math.max(newest, oldFormat.get(sessionId) || 0);
 }
 
@@ -311,15 +329,10 @@ function readMeta(file) {
 
 function findSubagents(floorDir, sessionId) {
   const subs = [];
-  const nested = path.join(floorDir, sessionId, 'subagents');
-  try {
-    for (const f of fs.readdirSync(nested)) {
-      if (!f.endsWith('.jsonl') || !NAME_RE.test(f)) continue;
-      const file = path.join(nested, f);
-      const meta = readMeta(file.replace(/\.jsonl$/, '.meta.json'));
-      subs.push({ key: f.slice(0, -6), file, agentType: meta && (meta.agentType || meta.subagent_type) });
-    }
-  } catch { /* 하위 폴더 없음 */ }
+  for (const s of subagentFiles(floorDir, sessionId)) {
+    const meta = readMeta(s.file.replace(/\.jsonl$/, '.meta.json'));
+    subs.push({ key: s.name.slice(0, -6), file: s.file, agentType: meta && (meta.agentType || meta.subagent_type), wf: s.wf, desc: meta && meta.description });
+  }
   // 예전 버전: 프로젝트 폴더에 agent-*.jsonl 로 섞여 있다
   try {
     for (const f of fs.readdirSync(floorDir)) {
@@ -379,6 +392,7 @@ function sessionDelta(floorId, sessionId, cursor) {
     lastWrite = Math.max(lastWrite, st.mtimeMs);
     const head = subagentHead(sub.file, st);
     subsMeta[sub.key] = { prompt: head.prompt, agentId: head.agentId, agentType: sub.agentType || '', mtime: st.mtimeMs };
+    if (sub.wf) { subsMeta[sub.key].wf = sub.wf; subsMeta[sub.key].desc = typeof sub.desc === 'string' ? clip(sub.desc, 40) : ''; }
     let off = prevSubs[sub.key];
     let tail = null;
     if (typeof off !== 'number') {

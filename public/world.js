@@ -1124,10 +1124,12 @@ function drawBubble(ctx, x, y, b, placed) {
   const h = Math.max(lines.length * lh + 12, st.badge ? 28 : 0);
   // 오류 말풍선은 처음 0.6초 동안 좌우로 흔들린다
   const shake = st.shake && age < 600 ? Math.sin(age / 22) * 3 * (1 - age / 600) : 0;
-  // 화면 가장자리의 캐릭터도 말풍선이 잘리지 않게 안쪽으로 당긴다 (꼬리 끝은 캐릭터를 가리킨다)
+  // 화면 가장자리의 캐릭터도 말풍선이 잘리지 않게 안쪽으로 당긴다 (꼬리 끝은 캐릭터를 가리킨다).
+  // 캐릭터가 화면 밖이면 당기지 않는다. 당기면 화면 안의 다른 캐릭터가 말하는 것처럼 보인다
   const ds = ctx.getTransform().a;
   const vw = ctx.canvas.width / ds;
-  const bx = Math.round(Math.max(4, Math.min(vw - w - 4, x - w / 2)) + shake);
+  const cx = x - w / 2;
+  const bx = Math.round((x >= 0 && x <= vw ? Math.max(4, Math.min(vw - w - 4, cx)) : cx) + shake);
   let by = Math.round(y - h - 12);
   // 다른 말풍선과 겹치면 위로 올린다
   for (let moved = true, n = 0; moved && n < 8; n++) {
