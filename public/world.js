@@ -1103,21 +1103,33 @@ function wrap(ctx, text, maxW, maxLines) {
 const BUBBLE = {
   say: { bg: '#ffffff', line: '#d9c8a8', text: '#4a3b2c' },
   think: { bg: '#f6f1ff', line: '#c2b0ec', text: '#4b3a7a' },
-  err: { bg: '#ffe9e9', line: '#e2575a', text: '#a02a2d' },
-  ask: { bg: '#fff6c9', line: '#e0b43a', text: '#6b5210' },
   report: { bg: '#eafbe5', line: '#6ab865', text: '#2f6b2b' },
   call: { bg: '#ffece4', line: '#e58a6a', text: '#8a3a20' },
+  // 눈에 띄어야 하는 말풍선: 진한 바탕, 굵은 글씨, 왼쪽 표지, 빛나는 테두리
+  err: { bg: ['#d42a35', '#b51f2a'], line: '#6e0f16', text: '#ffffff', bold: true, badge: '!', badgeBg: '#ffffff', badgeFg: '#d42a35', glow: '#ff3b47', shake: true },
+  ask: { bg: ['#ffd84d', '#ffb21a'], line: '#9a5a00', text: '#3d2600', bold: true, badge: '?', badgeBg: '#3d2600', badgeFg: '#ffd84d', glow: '#ffb21a', pulse: true },
+  wait: { bg: ['#fff1b8', '#ffd96a'], line: '#b07400', text: '#4a3200', bold: true, badge: '⏳', badgeBg: '#ffffff', badgeFg: '#b07400', glow: '#ffc53d', pulse: true, dash: [5, 3] },
 };
 
 function drawBubble(ctx, x, y, b, placed) {
   const st = BUBBLE[b.type] || BUBBLE.say;
+  const now = Date.now();
+  const age = now - (b.born || 0);
   ctx.save();
-  ctx.font = '12px "Gowun Dodum", "Apple SD Gothic Neo", "Malgun Gothic", sans-serif';
+  ctx.font = `${st.bold ? 'bold ' : ''}12px "Gowun Dodum", "Apple SD Gothic Neo", "Malgun Gothic", sans-serif`;
+  const pad = st.badge ? 30 : 10;
   const lines = wrap(ctx, b.text || '…', 168, b.type === 'think' ? 2 : 3);
-  const w = Math.max(...lines.map(l => ctx.measureText(l).width)) + 20;
+  const w = Math.max(...lines.map(l => ctx.measureText(l).width)) + pad + 10;
   const lh = 15;
-  const h = lines.length * lh + 12;
-  const bx = Math.round(x - w / 2);
+  const h = Math.max(lines.length * lh + 12, st.badge ? 28 : 0);
+  // 오류 말풍선은 처음 0.6초 동안 좌우로 흔들린다
+  const shake = st.shake && age < 600 ? Math.sin(age / 22) * 3 * (1 - age / 600) : 0;
+  // 화면 가장자리의 캐릭터도 말풍선이 잘리지 않게 안쪽으로 당긴다 (꼬리 끝은 캐릭터를 가리킨다).
+  // 캐릭터가 화면 밖이면 당기지 않는다. 당기면 화면 안의 다른 캐릭터가 말하는 것처럼 보인다
+  const ds = ctx.getTransform().a;
+  const vw = ctx.canvas.width / ds;
+  const cx = x - w / 2;
+  const bx = Math.round((x >= 0 && x <= vw ? Math.max(4, Math.min(vw - w - 4, cx)) : cx) + shake);
   let by = Math.round(y - h - 12);
   // 다른 말풍선과 겹치면 위로 올린다
   for (let moved = true, n = 0; moved && n < 8; n++) {
@@ -1129,20 +1141,42 @@ function drawBubble(ctx, x, y, b, placed) {
   placed.push({ x: bx, y: by, w, h });
   const tailY = Math.min(y - 4, by + h + 8);
   ctx.globalAlpha = b.alpha == null ? 1 : b.alpha;
-  ctx.shadowColor = 'rgba(80,60,30,.18)'; ctx.shadowBlur = 6; ctx.shadowOffsetY = 2;
-  ctx.fillStyle = st.bg; ctx.strokeStyle = st.line; ctx.lineWidth = 2;
+  let fill = st.bg;
+  if (Array.isArray(st.bg)) { fill = ctx.createLinearGradient(0, by, 0, by + h); fill.addColorStop(0, st.bg[0]); fill.addColorStop(1, st.bg[1]); }
+  if (st.glow) {
+    const k = st.pulse ? 0.5 + 0.5 * Math.sin(now / 260) : 1;
+    ctx.shadowColor = st.glow; ctx.shadowBlur = (8 + 10 * k) * ds; ctx.shadowOffsetY = 0;   // 그림자 크기는 기기 픽셀 단위
+  } else { ctx.shadowColor = 'rgba(80,60,30,.18)'; ctx.shadowBlur = 6; ctx.shadowOffsetY = 2; }
+  ctx.fillStyle = fill; ctx.strokeStyle = st.line; ctx.lineWidth = st.glow ? 2.6 : 2;
+  if (st.dash) ctx.setLineDash(st.dash);
   if (b.type === 'think') {
     ctx.beginPath(); ctx.roundRect(bx, by, w, h, h / 2); ctx.fill();
     ctx.shadowColor = 'transparent'; ctx.stroke();
     for (const [dx, dy, r] of [[-4, 6, 4], [-9, 13, 2.5]]) { ctx.beginPath(); ctx.arc(x + dx, by + h + dy - 2, r, 0, Math.PI * 2); ctx.fill(); ctx.stroke(); }
   } else {
+    const tx = x + shake, bt = Math.max(bx + 12, Math.min(bx + w - 12, tx));
     ctx.beginPath(); ctx.roundRect(bx, by, w, h, 11); ctx.fill();
     ctx.shadowColor = 'transparent'; ctx.stroke();
-    ctx.beginPath(); ctx.moveTo(x - 6, by + h - 1); ctx.lineTo(x, tailY); ctx.lineTo(x + 6, by + h - 1); ctx.closePath(); ctx.fill();
-    ctx.beginPath(); ctx.moveTo(x - 6, by + h); ctx.lineTo(x, tailY); ctx.lineTo(x + 6, by + h); ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.fillStyle = Array.isArray(st.bg) ? st.bg[1] : fill;
+    ctx.beginPath(); ctx.moveTo(bt - 6, by + h - 1); ctx.lineTo(tx, tailY); ctx.lineTo(bt + 6, by + h - 1); ctx.closePath(); ctx.fill();
+    ctx.beginPath(); ctx.moveTo(bt - 6, by + h); ctx.lineTo(tx, tailY); ctx.lineTo(bt + 6, by + h); ctx.stroke();
+  }
+  ctx.setLineDash([]);
+  if (st.badge) {
+    // 왼쪽 동그란 표지: 오류 !, 질문 ?, 승인 대기 ⏳
+    const cx = bx + 15, cy = by + h / 2;
+    ctx.fillStyle = st.badgeBg; ctx.beginPath(); ctx.arc(cx, cy, 9, 0, Math.PI * 2); ctx.fill();
+    ctx.strokeStyle = st.line; ctx.lineWidth = 1.4; ctx.stroke();
+    ctx.fillStyle = st.badgeFg; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.font = 'bold 13px "Jua", sans-serif';
+    ctx.fillText(st.badge, cx, cy + 0.5);
+    ctx.font = `${st.bold ? 'bold ' : ''}12px "Gowun Dodum", "Apple SD Gothic Neo", "Malgun Gothic", sans-serif`;
   }
   ctx.fillStyle = st.text; ctx.textAlign = 'left'; ctx.textBaseline = 'top';
-  lines.forEach((l, i) => ctx.fillText(l, bx + 10, by + 7 + i * lh));
+  if (st.text === '#ffffff') { ctx.shadowColor = 'rgba(120,0,10,.45)'; ctx.shadowBlur = 2 * ds; ctx.shadowOffsetY = ds; }
+  const ty = by + (h - lines.length * lh) / 2 + 1;
+  lines.forEach((l, i) => ctx.fillText(l, bx + pad, ty + i * lh));
   ctx.restore();
 }
 
