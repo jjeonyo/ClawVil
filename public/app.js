@@ -739,7 +739,25 @@ function zoom(f, cx, cy) {
   $('#zoomOut').onclick = () => zoom(1 / 1.2);
   $('#zoomFit').onclick = () => { app.cam.touched = false; fit(); };
   window.addEventListener('resize', resize);
+  // 층별 안내를 접고 펴면 지도 크기가 바뀐다
+  if (window.ResizeObserver) new ResizeObserver(() => resize()).observe(canvas.parentElement);
 })();
+
+// -------- 층별 안내 접기 (접은 상태는 이 브라우저에 기억한다)
+
+const FOLD_KEY = 'clawd-village:left-folded';
+function setLeftFolded(folded) {
+  $('#app').classList.toggle('left-folded', folded);
+  const btn = $('#leftToggle');
+  const label = folded ? '층별 안내 펼치기' : '층별 안내 접기';
+  btn.title = label; btn.setAttribute('aria-label', label); btn.setAttribute('aria-expanded', String(!folded));
+  try { localStorage.setItem(FOLD_KEY, folded ? '1' : '0'); } catch { /* 저장소를 못 쓰는 브라우저 */ }
+  resize();
+}
+$('#leftToggle').addEventListener('click', e => { e.stopPropagation(); setLeftFolded(!$('#app').classList.contains('left-folded')); });
+// 접힌 띠는 어디를 눌러도 펼친다
+$('#leftSign').addEventListener('click', () => { if ($('#app').classList.contains('left-folded')) setLeftFolded(false); });
+try { if (localStorage.getItem(FOLD_KEY) === '1') setLeftFolded(true); } catch { /* 저장소를 못 쓰는 브라우저 */ }
 
 // -------- 데이터
 

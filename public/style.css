@@ -51,7 +51,8 @@ body {
   font-family: var(--round);
   font-size: 18px;
 }
-.sign small { font-size: 11px; opacity: .85; letter-spacing: .08em; margin-left: auto; }
+.sign span { white-space: nowrap; }
+.sign small { font-size: 11px; opacity: .85; letter-spacing: .08em; margin-left: auto; white-space: nowrap; }
 .sign.small { font-size: 15px; padding: 5px 12px; margin: 10px 12px 4px; }
 
 /* ---------- 층 안내 */
@@ -228,13 +229,39 @@ code { background: #f3e7cf; padding: 1px 6px; border-radius: 6px; font-size: .9e
 #legend b { font-weight: normal; font-family: var(--round); white-space: nowrap; }
 #legend em { font-style: normal; color: var(--muted); font-size: 10px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 
+/* ---------- 층별 안내 접기: 접으면 세로 띠만 남고, 띠를 누르면 다시 펼친다 */
+.fold {
+  align-self: center; flex: none; width: 24px; height: 24px; padding: 0; cursor: pointer;
+  border: 2px solid var(--wood-dark); border-radius: 8px; background: #fffaf0; color: var(--wood-dark);
+  font-size: 11px; line-height: 1; display: grid; place-items: center;
+}
+.fold:hover { background: #fff1d6; }
+.fold::before { content: '◀'; }
+#app.left-folded { grid-template-columns: 52px 1fr 310px; }
+#app.left-folded #floors, #app.left-folded #left .root { display: none; }
+#app.left-folded #left .sign { flex-direction: column; align-items: center; gap: 10px; margin: 8px 6px; padding: 10px 4px; cursor: pointer; }
+#app.left-folded #left .sign span { writing-mode: vertical-rl; letter-spacing: .12em; font-size: 16px; }
+#app.left-folded #left .sign small { display: none; }
+#app.left-folded .fold { order: -1; }
+#app.left-folded .fold::before { content: '▶'; }
+
 @media (max-width: 1100px) {
   #app { grid-template-columns: 220px 1fr; }
+  #app.left-folded { grid-template-columns: 52px 1fr; }
   #right { display: none; }
+  #left .sign small { display: none; }
+  #left .fold { margin-left: auto; }
 }
 @media (max-width: 720px) {
   #app { grid-template-columns: 1fr; grid-template-rows: 1fr 180px; padding: 8px; }
   #left { order: 2; }
   .where { max-width: 100%; }
   .theme { display: none; }
+  /* 좁은 화면에서는 층별 안내가 지도 아래에 있으니 아래로 접는다 */
+  .fold::before { content: '▼'; }
+  #app.left-folded { grid-template-columns: 1fr; grid-template-rows: 1fr auto; }
+  #app.left-folded #left .sign { flex-direction: row; align-items: center; gap: 8px; margin: 8px 10px; padding: 6px 12px; }
+  #app.left-folded #left .sign span { writing-mode: horizontal-tb; letter-spacing: 0; font-size: 16px; }
+  #app.left-folded .fold { order: 0; }
+  #app.left-folded .fold::before { content: '▲'; }
 }
