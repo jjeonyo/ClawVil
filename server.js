@@ -13,6 +13,7 @@ const PORT = Number(args.port || process.env.PORT || 4848);
 const HOST = args.host || '127.0.0.1';
 // Host 헤더에서는 IPv6 주소가 [::1] 처럼 대괄호로 싸여 온다
 const HOST_HEADER = HOST.includes(':') && !HOST.startsWith('[') ? `[${HOST}]` : HOST;
+const ANY_HOST = ['0.0.0.0', '::', '[::]'].includes(HOST);   // 모든 주소로 열었다
 const PUBLIC_DIR = path.join(__dirname, 'public');
 
 let ROOT = args.dir || process.env.CLAUDE_PROJECTS_DIR ||
@@ -30,6 +31,9 @@ const NAME_RE = /^[A-Za-z0-9._-]+$/;
 function userName() {
   try { return os.userInfo().username; } catch { return process.env.USER || process.env.USERNAME || 'me'; }
 }
+
+// 폴더·세션 이름으로 받아도 되는 값인가 ('.'·'..'는 상위 폴더를 가리키므로 안 된다)
+const validName = s => NAME_RE.test(s) && s !== '.' && s !== '..';
 
 function parseArgs(argv) {
   const out = {};
@@ -139,6 +143,24 @@ function compact(rec, src) {
   if (rec.agentId) base.agentId = rec.agentId;
 
   switch (rec.type) {
+    case 'queue-operation': {
+      // 백그라운드 작업(서브에이전트·워크플로·명령)이 끝났다는 알림. 호출 결과는 시작할 때 이미 왔으므로 진짜 끝은 이것으로 안다
+      const c = rec.operation === 'enqueue' && typeof rec.content === 'string' ? rec.content.trim() : '';
+      if (!c.startsWith('<task-notification')) break;
+      const tag = name => { const m = c.match(new RegExp(`<${name}>([\\s\\S]*?)</${name}>`)); return m ? m[1].trim() : ''; };
+      const id = tag('tool-use-id');
+      if (id) out.push({ ...base, k: 'tasknote', id, status: tag('status'), text: clip(tag('summary'), 160) });
+      break;
+    }
+    case 'attachment': {
+      // Claude가 일하는 도중 내가 보낸 메시지는 사용자 기록이 아니라 이 첨부로만 남는다
+      const a = rec.attachment;
+      if (!a || a.type !== 'queued_command' || a.commandMode !== 'prompt' || rec.isMeta) break;
+      if (!(a.origin ? a.origin.kind === 'human' : a.humanTurn)) break;
+      const p = cleanPrompt(typeof a.prompt === 'string' ? a.prompt : '');
+      if (p.text) out.push({ ...base, k: 'prompt', text: clip(p.text, 300), queued: true });
+      break;
+    }
     case 'custom-title':
       if (rec.customTitle) out.push({ ...base, k: 'title', text: clip(rec.customTitle, 80) });
       break;
@@ -162,7 +184,8 @@ function compact(rec, src) {
     }
     case 'assistant': {
       const m = rec.message || {};
-      if (rec.isApiErrorMessage) { out.push({ ...base, k: 'apierr', text: clip(resultText(m.content), 160) }); break; }
+      // 재시도까지 실패해 답변 대신 남은 오류(사용량 한도 등). 이걸로 그 답변은 끝난다
+      if (rec.isApiErrorMessage) { out.push({ ...base, k: 'apierr', final: true, text: clip(resultText(m.content), 160) }); break; }
       if (!Array.isArray(m.content)) break;
       // mid: 한 번의 API 응답에서 나온 기록끼리 같은 값. 화면에서 Claude의 단계 경계를 가르는 데 쓴다
       const ab = m.id ? { ...base, mid: m.id } : base;
@@ -331,7 +354,8 @@ function findSubagents(floorDir, sessionId) {
   const subs = [];
   for (const s of subagentFiles(floorDir, sessionId)) {
     const meta = readMeta(s.file.replace(/\.jsonl$/, '.meta.json'));
-    subs.push({ key: s.name.slice(0, -6), file: s.file, agentType: meta && (meta.agentType || meta.subagent_type), wf: s.wf, desc: meta && meta.description });
+    subs.push({ key: s.name.slice(0, -6), file: s.file, agentType: meta && (meta.agentType || meta.subagent_type), wf: s.wf,
+      desc: meta && meta.description, toolUseId: meta && typeof meta.toolUseId === 'string' ? meta.toolUseId : null });
   }
   // 예전 버전: 프로젝트 폴더에 agent-*.jsonl 로 섞여 있다
   try {
@@ -362,15 +386,17 @@ function readNew(file, offset, initialTail) {
     }
   } else if (start > st.size) { start = 0; reset = true; }
   const end = Math.min(st.size, start + MAX_CHUNK);
-  if (end <= start) return { offset: start, records: [], reset, size: st.size, mtime: st.mtimeMs };
+  // more: MAX_CHUNK에서 끊어 읽어 뒤에 더 읽을 줄이 남았다. 마지막 줄이 아직 덜 쓰였을 뿐이면 false다
+  const more = end < st.size;
+  if (end <= start) return { offset: start, records: [], reset, more: false, size: st.size, mtime: st.mtimeMs };
   const buf = readRange(file, start, end);
   const nl = buf.lastIndexOf(0x0a);
   if (nl < 0) {
     // 줄 하나가 MAX_CHUNK보다 크면 그 줄은 버리고 다음 줄부터 읽는다
     const skip = buf.length === MAX_CHUNK ? end : start;
-    return { offset: skip, records: [], reset, size: st.size, mtime: st.mtimeMs };
+    return { offset: skip, records: [], reset, more, size: st.size, mtime: st.mtimeMs };
   }
-  return { offset: start + nl + 1, records: parseLines(buf.subarray(0, nl)), reset, size: st.size, mtime: st.mtimeMs };
+  return { offset: start + nl + 1, records: parseLines(buf.subarray(0, nl)), reset, more, size: st.size, mtime: st.mtimeMs };
 }
 
 function sessionDelta(floorId, sessionId, cursor) {
@@ -387,24 +413,31 @@ function sessionDelta(floorId, sessionId, cursor) {
   const now = Date.now();
   let lastWrite = main.mtime;
   for (const sub of findSubagents(floorDir, sessionId)) {
-    let st;
-    try { st = fs.statSync(sub.file); } catch { continue; }
-    lastWrite = Math.max(lastWrite, st.mtimeMs);
-    const head = subagentHead(sub.file, st);
-    subsMeta[sub.key] = { prompt: head.prompt, agentId: head.agentId, agentType: sub.agentType || '', mtime: st.mtimeMs };
-    if (sub.wf) { subsMeta[sub.key].wf = sub.wf; subsMeta[sub.key].desc = typeof sub.desc === 'string' ? clip(sub.desc, 40) : ''; }
-    let off = prevSubs[sub.key];
-    let tail = null;
-    if (typeof off !== 'number') {
-      if (initial) {
-        // 처음 열 때: 끝난 지 오래된 서브에이전트는 건너뛰고, 최근 것만 끝부분을 읽는다.
-        // 긴 명령을 기다리는 동안에는 기록이 멈추므로 넉넉하게 30분까지 본다.
-        if (now - st.mtimeMs > SUB_RECENT_MS) off = st.size; else { off = null; tail = SUB_INITIAL_TAIL; }
-      } else off = 0; // 새로 생긴 서브에이전트
+    // 파일 하나를 못 읽어도(권한, 도중에 지워짐 등) 세션 전체가 멈추지 않게 그 파일만 건너뛴다
+    try {
+      const st = fs.statSync(sub.file);
+      if (!st.isFile()) continue;
+      lastWrite = Math.max(lastWrite, st.mtimeMs);
+      const head = subagentHead(sub.file, st);
+      subsMeta[sub.key] = { prompt: head.prompt, agentId: head.agentId, agentType: sub.agentType || '', mtime: st.mtimeMs,
+        desc: typeof sub.desc === 'string' ? clip(sub.desc, 40) : '', toolUseId: sub.toolUseId || undefined };
+      if (sub.wf) subsMeta[sub.key].wf = sub.wf;
+      let off = prevSubs[sub.key];
+      let tail = null;
+      if (typeof off !== 'number') {
+        if (initial) {
+          // 처음 열 때: 끝난 지 오래된 서브에이전트는 건너뛰고, 최근 것만 끝부분을 읽는다.
+          // 긴 명령을 기다리는 동안에는 기록이 멈추므로 넉넉하게 30분까지 본다.
+          if (now - st.mtimeMs > SUB_RECENT_MS) off = st.size; else { off = null; tail = SUB_INITIAL_TAIL; }
+        } else off = 0; // 새로 생긴 서브에이전트
+      }
+      const r = readNew(sub.file, off, tail);
+      nextSubs[sub.key] = r.offset;
+      for (const rec of r.records) events.push(...compact(rec, 'sub:' + sub.key));
+    } catch {
+      // 이 서브에이전트만 건너뛰되, 읽던 위치는 지켜 다음에 처음부터 다시 읽지 않게 한다
+      if (typeof prevSubs[sub.key] === 'number') nextSubs[sub.key] = prevSubs[sub.key];
     }
-    const r = readNew(sub.file, off, tail);
-    nextSubs[sub.key] = r.offset;
-    for (const rec of r.records) events.push(...compact(rec, 'sub:' + sub.key));
   }
   events.sort((a, b) => (a.t || 0) - (b.t || 0));
   return {
@@ -413,7 +446,7 @@ function sessionDelta(floorId, sessionId, cursor) {
     reset: main.reset,
     cursor: { m: main.offset, s: nextSubs },
     subs: subsMeta,
-    session: { id: sessionId, mtime: lastWrite, active: now - lastWrite < ACTIVE_MS, more: main.offset < main.size },
+    session: { id: sessionId, mtime: lastWrite, active: now - lastWrite < ACTIVE_MS, more: main.more },
   };
 }
 
@@ -440,19 +473,25 @@ function serveStatic(req, res, pathname) {
 }
 
 const server = http.createServer((req, res) => {
-  const url = new URL(req.url, 'http://localhost');
-  // 다른 사이트가 이 서버를 읽어 가지 못하도록 Host 헤더를 확인한다 (DNS 리바인딩 방지)
+  // 다른 사이트가 이 서버를 읽어 가지 못하도록 Host 헤더를 확인한다 (DNS 리바인딩 방지).
+  // localhost 같은 이름은 이 PC 안에서 온 연결에만 허용한다. 다른 기기는 Host를 마음대로 적을 수 있으므로
+  // --host에 준 주소로 들어온 경우만 받는다 (0.0.0.0 같은 '모든 주소'로 열었으면 다른 기기는 받지 않는다)
   const rawHost = req.headers.host || '';
   const host = rawHost.startsWith('[') ? rawHost.slice(0, rawHost.indexOf(']') + 1) : rawHost.split(':')[0];
-  if (!['localhost', '127.0.0.1', '[::1]', HOST_HEADER].includes(host)) { res.writeHead(403); return res.end(); }
+  const remote = req.socket.remoteAddress || '';
+  const fromThisPc = remote === '::1' || remote.startsWith('127.') || remote.startsWith('::ffff:127.');
+  const allowed = fromThisPc ? ['localhost', '127.0.0.1', '[::1]', HOST_HEADER].includes(host) : (!ANY_HOST && host === HOST_HEADER);
+  if (!allowed) { res.writeHead(403); return res.end(); }
   try {
+    let url;
+    try { url = new URL(req.url, 'http://localhost'); } catch { return sendJson(res, 400, { error: 'bad url' }); }
     if (url.pathname === '/api/floors') {
       return sendJson(res, 200, { root: ROOT, user: userName(), demo: !!args.demo, now: Date.now(), floors: listFloors() });
     }
     if (url.pathname === '/api/session') {
       const floor = url.searchParams.get('floor') || '';
       const session = url.searchParams.get('session') || '';
-      if (!NAME_RE.test(floor) || !NAME_RE.test(session)) return sendJson(res, 400, { error: 'bad name' });
+      if (!validName(floor) || !validName(session)) return sendJson(res, 400, { error: 'bad name' });
       let cursor = null;
       const c = url.searchParams.get('c');
       if (c) { try { cursor = JSON.parse(c); } catch { return sendJson(res, 400, { error: 'bad cursor' }); } }

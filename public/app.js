@@ -80,8 +80,9 @@ function describeTool(name, i = {}) {
 
 // 서브에이전트가 결과를 넘기는 마지막 도구. 끝을 알리는 호출 결과가 따로 없는 서브에이전트(백그라운드·워크플로)는 이걸로 끝을 안다
 const FINAL_TOOLS = new Set(['StructuredOutput', 'SubagentHandback']);
-const RESUMED_QUIET_MS = 30000;   // 다시 일하러 간 서브에이전트가 이만큼 조용하면 끝난 것으로 본다
-const WF_QUIET_MS = 5 * 60e3;     // 워크플로 에이전트는 이만큼 조용해야 끝난 것으로 본다
+// 끝을 알리는 호출 결과가 없는 서브에이전트(백그라운드·워크플로·다시 일하러 간)가 이만큼 조용하면 끝난 것으로 본다.
+// 서브에이전트는 도구 없이 1~2분씩 생각하기도 하니 넉넉히 잡는다. 보통은 완료 알림이나 마지막 보고로 먼저 끝난다
+const RESUMED_QUIET_MS = 5 * 60e3;
 // Claude Code는 명령이 도는 동안 기록을 쓰지 않는다. 끝나지 않은 도구가 있으면 이 시간까지는 일하는 중으로 본다.
 const WAIT_MS = 30 * 60e3;
 
@@ -137,6 +138,7 @@ class Town {
     this.subs = new Map();        // Task tool_use id → Agent
     this.subByFile = new Map();   // 서브에이전트 기록 파일 → Agent
     this.subsMeta = {};
+    this.taskNotes = new Set();   // 이미 처리한 완료 알림 (같은 알림이 여러 번 기록된다)
     this.pending = new Map();     // tool_use id → { agent, ev, at }
     this.reserved = new Map();    // spot → Agent
     this.timers = [];
@@ -266,7 +268,7 @@ class Town {
       // 워크플로가 띄운 에이전트: 따로 부른 호출이 없으니 기록만 보고 데려온다. 끝은 마지막 보고(FINAL_TOOLS)나
       // 마지막 답변, 또는 한동안 조용한 것으로 판단한다 (updateSubs)
       const w = this.spawnSub({ id: 'file:' + key, t: ev && ev.t, input: { subagent_type: '워크플로', description: meta.desc || short(meta.prompt, 20), prompt: meta.prompt } }, this.replaying);
-      w.resumed = true; w.wf = true;
+      w.resumed = true;
       if (meta.agentId) w.agentId = meta.agentId;
       w.fileKey = key;
       this.subByFile.set(key, w);
@@ -274,14 +276,17 @@ class Town {
     }
     const norm = s => String(s || '').replace(/\s+/g, ' ').trim().slice(0, 80);
     const cands = [...this.subs.values()].filter(s => !s.fileKey && !s.gone);
-    let a = cands.find(s => meta.agentId && s.agentId === meta.agentId)
+    // meta.json의 toolUseId는 이 서브에이전트를 부른 호출 ID다. 있으면 그것으로 정확히 잇는다
+    const byCall = meta.toolUseId ? this.subs.get(meta.toolUseId) : null;
+    let a = (byCall && !byCall.fileKey && !byCall.gone ? byCall : null)
+      || cands.find(s => meta.agentId && s.agentId === meta.agentId)
       || cands.find(s => meta.prompt && norm(s.prompt) === norm(meta.prompt))
       || cands[0];
     if (!a) {
       // Task 호출이 읽은 범위 밖에 있었던 경우: 기록만 보고 데려온다. 호출 결과는 agentId로 찾아 잇고,
       // 그마저 없으면 다시 일하러 간 서브에이전트처럼 한동안 조용할 때 보고하러 간다 (updateSubs)
-      a = this.spawnSub({ id: 'file:' + key, t: ev && ev.t, input: { subagent_type: meta.agentType || '', description: short(meta.prompt, 20), prompt: meta.prompt } }, true);
-      if (!meta.agentId) a.resumed = true;
+      a = this.spawnSub({ id: 'file:' + key, t: ev && ev.t, input: { subagent_type: meta.agentType || '', description: meta.desc || short(meta.prompt, 20), prompt: meta.prompt } }, true);
+      a.resumed = true;
     }
     if (meta.agentId) a.agentId = meta.agentId;
     a.fileKey = key;
@@ -316,6 +321,10 @@ class Town {
     switch (ev.k) {
       case 'prompt': {
         if (a.kind === 'sub') { a.activity = '맡은 일 확인 중'; break; }
+        // 일하는 도중 보낸 메시지(queued)가 나중에 일반 기록으로 한 번 더 남는 경우를 걸러 낸다
+        const lp = this.lastPrompt;
+        if (lp && lp.text === ev.text && (lp.queued || ev.queued) && Math.abs((ev.t || now) - lp.t) < 120000) break;
+        this.lastPrompt = { text: ev.text, t: ev.t || now, queued: !!ev.queued };
         this.turnActive = true;
         this.user.say('say', ev.text, 5000);
         this.userTypingUntil = now + 2500;
@@ -351,7 +360,15 @@ class Town {
         break;
       }
       case 'stop': if (a === this.claude && this.turnActive) this.endTurn(null, ev.t); break;
-      case 'apierr': a.say('err', 'API 오류: ' + (ev.text || ''), 4000); a.sweatUntil = now + 4000; this.log(a, '⚠️ ' + (ev.text || 'API 오류'), { t: ev.t, err: true }); break;
+      case 'apierr': {
+        a.say('err', 'API 오류: ' + (ev.text || ''), 4000); a.sweatUntil = now + 4000; this.log(a, '⚠️ ' + (ev.text || 'API 오류'), { t: ev.t, err: true });
+        if (!ev.final) break;
+        // 재시도까지 실패한 오류(사용량 한도 등)는 그 답변을 끝낸다
+        if (a === this.claude) { if (this.turnActive || a.state !== 'idle') this.endTurn(null, ev.t, true); }
+        else if (a.kind === 'sub') { a.resumed = false; this.finishSub(a, { text: ev.text, err: true }); }
+        break;
+      }
+      case 'tasknote': this.onTaskNote(ev); break;
       case 'compact': this.log(a, '🧹 대화 압축', { t: ev.t }); break;
     }
   }
@@ -403,8 +420,9 @@ class Town {
       || (ev.agent ? [...this.subs.values()].find(s => s.agentId === ev.agent && !s.gone && s.state !== 'reporting' && s.state !== 'leaving') : null);
     if (sub && !sub.gone) {
       if (ev.async) {
-        // 백그라운드 서브에이전트: 호출 결과는 시작할 때 바로 온다. 끝은 기록이 멈추는 것으로 판단한다.
+        // 백그라운드 서브에이전트: 호출 결과는 시작할 때 바로 온다. 끝은 완료 알림(tasknote)이나 마지막 보고로 안다
         sub.resumed = true;
+        if (ev.agent) sub.agentId = ev.agent;
         this.log(sub, '🌙 백그라운드에서 일하는 중');
       } else { sub.resumed = false; this.finishSub(sub, ev); }
     }
@@ -456,7 +474,11 @@ class Town {
       this.later(450, null, () => {
         a.alpha = 1;
         this.later(1400, null, () => { if (a.eyes === 'happy') a.eyes = null; });
-        if (a.state === 'arriving') {
+        if (a.state === 'arriving' && a.pendingFinish) {
+          const f = a.pendingFinish;
+          a.pendingFinish = null; a.state = 'working';
+          this.finishSub(a, f);
+        } else if (a.state === 'arriving') {
           const to = a.nextRoom || room;
           a.state = 'working';
           if (!a.nextRoom) a.activity = '일하러 가는 중';
@@ -467,10 +489,27 @@ class Town {
     return a;
   }
 
+  // 백그라운드 작업이 끝났다는 알림. 서브에이전트면 보고하러 오고, 명령·워크플로면 로그만 남긴다
+  onTaskNote(ev) {
+    const key = ev.id + ':' + ev.status;
+    if (this.taskNotes.has(key)) return;
+    this.taskNotes.add(key);
+    const failed = ev.status !== 'completed';
+    const sub = this.subs.get(ev.id);
+    if (sub) {
+      if (sub.gone || sub.state === 'reporting' || sub.state === 'leaving') return;
+      sub.resumed = false;
+      this.finishSub(sub, { text: failed ? ev.text : '', err: failed });
+      return;
+    }
+    if (ev.text) this.log(this.claude, (failed ? '💦 ' : '✅ ') + ev.text, { t: ev.t, err: failed });
+  }
+
   finishSub(a, ev) {
     for (const [id, p] of this.pending) if (p.agent === a) this.pending.delete(id);
-    // 재생 중이거나, 엘리베이터에서 내리기도 전에 끝났으면 그냥 보낸다
-    if (this.replaying || a.state === 'arriving') { this.removeSub(a); return; }
+    if (this.replaying) { this.removeSub(a); return; }
+    // 엘리베이터에서 내리기도 전에 끝났으면 내린 뒤에 보고하러 간다 (첫 기록부터 실패한 경우 등)
+    if (a.state === 'arriving') { a.pendingFinish = ev; return; }
     a.state = 'reporting'; a.activity = '보고하러 가는 중'; a.emote = null;
     a.unsay(b => !(b.type === 'err' && Date.now() - b.born < ERR_HOLD_MS));   // 막 뜬 오류 말풍선은 남긴다
     const spot = this.spotNearClaude(a);
@@ -626,9 +665,7 @@ class Town {
       const busy = [...this.pending.values()].some(p => p.agent === a);
       const quiet = now - a.lastAt;
       // 끝나지 않은 도구가 있어도 결과가 끝내 안 오면(4MB 넘는 줄, 도중에 끈 경우) WAIT_MS 뒤에는 끝난 것으로 본다
-      // 워크플로 에이전트는 끝을 알리는 마지막 보고가 있으니 생각이 길어져 조용한 것을 끝으로 오해하지 않게 더 기다린다
-      const quietMs = a.wf ? WF_QUIET_MS : RESUMED_QUIET_MS;
-      if (busy ? quiet > WAIT_MS : (quiet > quietMs || !live)) { a.resumed = false; this.finishSub(a, { text: '', err: false }); }
+      if (busy ? quiet > WAIT_MS : (quiet > RESUMED_QUIET_MS || !live)) { a.resumed = false; this.finishSub(a, { text: '', err: false }); }
     }
   }
 
