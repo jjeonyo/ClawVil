@@ -743,21 +743,28 @@ function zoom(f, cx, cy) {
   if (window.ResizeObserver) new ResizeObserver(() => resize()).observe(canvas.parentElement);
 })();
 
-// -------- 층별 안내 접기 (접은 상태는 이 브라우저에 기억한다)
+// -------- 패널 접기 (접은 상태는 이 브라우저에 기억한다)
 
-const FOLD_KEY = 'clawd-village:left-folded';
-function setLeftFolded(folded) {
-  $('#app').classList.toggle('left-folded', folded);
-  const btn = $('#leftToggle');
-  const label = folded ? '층별 안내 펼치기' : '층별 안내 접기';
+const FOLDS = {
+  left: { cls: 'left-folded', panel: '#left', btn: '#leftToggle', name: '층별 안내' },
+  right: { cls: 'right-folded', panel: '#right', btn: '#rightToggle', name: '사무실 현황' },
+};
+const isFolded = side => $('#app').classList.contains(FOLDS[side].cls);
+function setFolded(side, folded) {
+  const f = FOLDS[side];
+  $('#app').classList.toggle(f.cls, folded);
+  const btn = $(f.btn);
+  const label = `${f.name} ${folded ? '펼치기' : '접기'}`;
   btn.title = label; btn.setAttribute('aria-label', label); btn.setAttribute('aria-expanded', String(!folded));
-  try { localStorage.setItem(FOLD_KEY, folded ? '1' : '0'); } catch { /* 저장소를 못 쓰는 브라우저 */ }
+  try { localStorage.setItem(`clawd-village:${side}-folded`, folded ? '1' : '0'); } catch { /* 저장소를 못 쓰는 브라우저 */ }
   resize();
 }
-$('#leftToggle').addEventListener('click', e => { e.stopPropagation(); setLeftFolded(!$('#app').classList.contains('left-folded')); });
-// 접힌 띠는 어디를 눌러도 펼친다
-$('#leftSign').addEventListener('click', () => { if ($('#app').classList.contains('left-folded')) setLeftFolded(false); });
-try { if (localStorage.getItem(FOLD_KEY) === '1') setLeftFolded(true); } catch { /* 저장소를 못 쓰는 브라우저 */ }
+for (const side of Object.keys(FOLDS)) {
+  $(FOLDS[side].btn).addEventListener('click', e => { e.stopPropagation(); setFolded(side, !isFolded(side)); });
+  // 접힌 띠는 어디를 눌러도 펼친다
+  $(FOLDS[side].panel).addEventListener('click', () => { if (isFolded(side)) setFolded(side, false); });
+  try { if (localStorage.getItem(`clawd-village:${side}-folded`) === '1') setFolded(side, true); } catch { /* 저장소를 못 쓰는 브라우저 */ }
+}
 
 // -------- 데이터
 

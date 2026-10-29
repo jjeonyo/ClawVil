@@ -21,8 +21,9 @@ body {
 }
 
 #app {
+  --lw: 260px; --rw: 310px;   /* 왼쪽·오른쪽 패널 폭. 접으면 52px 띠가 된다 */
   display: grid;
-  grid-template-columns: 260px 1fr 310px;
+  grid-template-columns: var(--lw) 1fr var(--rw);
   gap: 12px;
   height: 100vh;
   padding: 12px;
@@ -184,7 +185,7 @@ code { background: #f3e7cf; padding: 1px 6px; border-radius: 6px; font-size: .9e
 /* ---------- 오른쪽 패널 */
 #right section { padding: 0 0 4px; min-height: 0; display: flex; flex-direction: column; }
 #right section.grow { flex: 1; }
-.meta { padding: 12px 16px 0 !important; font-size: 11px; gap: 3px; }
+.meta { padding: 12px 44px 0 16px !important; font-size: 11px; gap: 3px; }
 .meta div { display: flex; gap: 8px; }
 .meta small { color: var(--muted); min-width: 44px; }
 .meta span { word-break: break-all; }
@@ -229,25 +230,39 @@ code { background: #f3e7cf; padding: 1px 6px; border-radius: 6px; font-size: .9e
 #legend b { font-weight: normal; font-family: var(--round); white-space: nowrap; }
 #legend em { font-style: normal; color: var(--muted); font-size: 10px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 
-/* ---------- 층별 안내 접기: 접으면 세로 띠만 남고, 띠를 누르면 다시 펼친다 */
+/* ---------- 패널 접기: 접으면 세로 띠만 남고, 띠를 누르면 다시 펼친다 */
 .fold {
   align-self: center; flex: none; width: 24px; height: 24px; padding: 0; cursor: pointer;
   border: 2px solid var(--wood-dark); border-radius: 8px; background: #fffaf0; color: var(--wood-dark);
   font-size: 11px; line-height: 1; display: grid; place-items: center;
 }
 .fold:hover { background: #fff1d6; }
-.fold::before { content: '◀'; }
-#app.left-folded { grid-template-columns: 52px 1fr 310px; }
+#app.left-folded { --lw: 52px; }
+#app.right-folded { --rw: 52px; }
+#app.left-folded #left, #app.right-folded #right { cursor: pointer; }
+/* 왼쪽: 층별 안내 */
+#left .fold::before { content: '◀'; }
 #app.left-folded #floors, #app.left-folded #left .root { display: none; }
-#app.left-folded #left .sign { flex-direction: column; align-items: center; gap: 10px; margin: 8px 6px; padding: 10px 4px; cursor: pointer; }
+#app.left-folded #left .sign { flex-direction: column; align-items: center; gap: 10px; margin: 8px 6px; padding: 10px 4px; }
 #app.left-folded #left .sign span { writing-mode: vertical-rl; letter-spacing: .12em; font-size: 16px; }
 #app.left-folded #left .sign small { display: none; }
-#app.left-folded .fold { order: -1; }
-#app.left-folded .fold::before { content: '▶'; }
+#app.left-folded #left .fold { order: -1; }
+#app.left-folded #left .fold::before { content: '▶'; }
+/* 오른쪽: 사무실 현황. 펼쳤을 때는 버튼만 오른쪽 위 구석에 있고, 접으면 왼쪽과 같은 띠가 된다 */
+#right { position: relative; }
+#right .rail { position: absolute; top: 9px; right: 9px; z-index: 1; margin: 0; padding: 0; background: none; border: 0; box-shadow: none; }
+#right .rail span { display: none; }
+#right .fold::before { content: '▶'; }
+#app.right-folded #right > section { display: none; }
+#app.right-folded #right .rail {
+  position: static; flex-direction: column; align-items: center; gap: 10px; margin: 8px 6px; padding: 10px 4px;
+  background: var(--wood); border: 2px solid var(--wood-dark); box-shadow: inset 0 -3px 0 rgba(0,0,0,.12);
+}
+#app.right-folded #right .rail span { display: block; writing-mode: vertical-rl; letter-spacing: .12em; font-size: 16px; white-space: nowrap; }
+#app.right-folded #right .fold::before { content: '◀'; }
 
 @media (max-width: 1100px) {
-  #app { grid-template-columns: 220px 1fr; }
-  #app.left-folded { grid-template-columns: 52px 1fr; }
+  #app { --lw: 220px; grid-template-columns: var(--lw) 1fr; }
   #right { display: none; }
   #left .sign small { display: none; }
   #left .fold { margin-left: auto; }
@@ -258,10 +273,10 @@ code { background: #f3e7cf; padding: 1px 6px; border-radius: 6px; font-size: .9e
   .where { max-width: 100%; }
   .theme { display: none; }
   /* 좁은 화면에서는 층별 안내가 지도 아래에 있으니 아래로 접는다 */
-  .fold::before { content: '▼'; }
-  #app.left-folded { grid-template-columns: 1fr; grid-template-rows: 1fr auto; }
+  #left .fold::before { content: '▼'; }
+  #app.left-folded { grid-template-rows: 1fr auto; }
   #app.left-folded #left .sign { flex-direction: row; align-items: center; gap: 8px; margin: 8px 10px; padding: 6px 12px; }
   #app.left-folded #left .sign span { writing-mode: horizontal-tb; letter-spacing: 0; font-size: 16px; }
-  #app.left-folded .fold { order: 0; }
-  #app.left-folded .fold::before { content: '▲'; }
+  #app.left-folded #left .fold { order: 0; }
+  #app.left-folded #left .fold::before { content: '▲'; }
 }
