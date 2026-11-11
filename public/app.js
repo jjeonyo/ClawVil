@@ -24,6 +24,14 @@ function dur(ms) {
   const s = Math.max(0, Math.round(ms / 1000));
   return s < 60 ? s + '초' : s < 3600 ? Math.floor(s / 60) + '분 ' + (s % 60) + '초' : Math.floor(s / 3600) + '시간 ' + Math.floor(s / 60 % 60) + '분';
 }
+// 토큰 수를 545k, 1.2M처럼 줄여 쓴다
+function tokens(n) {
+  return n >= 1e6 ? (n / 1e6).toFixed(1).replace(/\.0$/, '') + 'M' : n >= 1000 ? Math.round(n / 1000) + 'k' : String(n);
+}
+// 완료 알림에 붙어 온 통계: " · 도구 49회 · 12분 6초 · 203k 토큰"
+function usageText(ev) {
+  return (ev.tools ? ` · 도구 ${ev.tools}회` : '') + (ev.ms ? ` · ${dur(ev.ms)}` : '') + (ev.tok ? ` · ${tokens(ev.tok)} 토큰` : '');
+}
 function clock(t) {
   const d = new Date(t || Date.now());
   return d.toLocaleTimeString('ko-KR', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
@@ -80,6 +88,7 @@ function describeTool(name, i = {}) {
 
 // 서브에이전트가 결과를 넘기는 마지막 도구. 끝을 알리는 호출 결과가 따로 없는 서브에이전트(백그라운드·워크플로)는 이걸로 끝을 안다
 const FINAL_TOOLS = new Set(['StructuredOutput', 'SubagentHandback']);
+const NOTIFY_TURN_MS = 30000;   // 이보다 오래 걸린 답변이 끝나면 알림을 보낸다 (금방 끝난 답변은 알리지 않는다)
 // 끝을 알리는 호출 결과가 없는 서브에이전트(백그라운드·워크플로·다시 일하러 간)가 이만큼 조용하면 끝난 것으로 본다.
 // 서브에이전트는 도구 없이 1~2분씩 생각하기도 하니 넉넉히 잡는다. 보통은 완료 알림이나 마지막 보고로 먼저 끝난다
 const RESUMED_QUIET_MS = 5 * 60e3;
@@ -139,6 +148,9 @@ class Town {
     this.subByFile = new Map();   // 서브에이전트 기록 파일 → Agent
     this.subsMeta = {};
     this.taskNotes = new Set();   // 이미 처리한 완료 알림 (같은 알림이 여러 번 기록된다)
+    this.stats = {};              // 메인 세션의 모델, 컨텍스트 토큰, 브랜치
+    this.limit = null;            // 사용량 한도에 걸려 있으면 { until, text }
+    this.turnStartedAt = 0;       // 내가 보낸 요청으로 시작한 답변의 시작 시각 (알림용)
     this.pending = new Map();     // tool_use id → { agent, ev, at }
     this.reserved = new Map();    // spot → Agent
     this.timers = [];
@@ -298,9 +310,15 @@ class Town {
     const now = Date.now();
     if (ev.t) this.lastEventAt = Math.max(this.lastEventAt, ev.t);
     if (ev.k === 'title') { this.opts.onTitle && this.opts.onTitle(ev.text); return; }
+    if (ev.k === 'usage') {
+      this.stats = { model: ev.model || this.stats.model, ctx: ev.ctx, branch: ev.br || this.stats.branch };
+      return;
+    }
     const a = this.actorFor(ev);
     if (!a || a.gone) return;
     a.lastAt = now;
+    // Claude가 다시 응답하기 시작했으면 사용량 한도는 풀린 것이다
+    if (this.limit && a === this.claude && (ev.k === 'think' || ev.k === 'text' || ev.k === 'tool')) this.limit = null;
     if (a === this.claude && ev.mid && !ev.side && (ev.k === 'think' || ev.k === 'text' || ev.k === 'tool')) {
       // Claude는 도구 결과를 모두 받아야 다음 응답을 시작한다. 그런데도 남아 있는 이전 응답(다른 mid)의 도구는
       // 결과 줄이 빠진 것(4MB 넘는 줄 등)이니 끝난 것으로 정리한다. 서브에이전트 호출은 따로 끝을 판단한다.
@@ -325,6 +343,7 @@ class Town {
         const lp = this.lastPrompt;
         if (lp && lp.text === ev.text && (lp.queued || ev.queued) && Math.abs((ev.t || now) - lp.t) < 120000) break;
         this.lastPrompt = { text: ev.text, t: ev.t || now, queued: !!ev.queued };
+        if (!this.turnActive) this.turnStartedAt = ev.t || now;
         this.turnActive = true;
         this.user.say('say', ev.text, 5000);
         this.userTypingUntil = now + 2500;
@@ -356,6 +375,7 @@ class Town {
         }
         a.say('say', ev.text, 6000);
         this.log(a, '💬 ' + ev.text, { t: ev.t });
+        this.lastAnswer = ev.text;
         if (ev.stop === 'end_turn') this.endTurn(null, ev.t);
         break;
       }
@@ -363,13 +383,17 @@ class Town {
       case 'apierr': {
         a.say('err', 'API 오류: ' + (ev.text || ''), 4000); a.sweatUntil = now + 4000; this.log(a, '⚠️ ' + (ev.text || 'API 오류'), { t: ev.t, err: true });
         if (!ev.final) break;
+        if (ev.until) this.limit = { until: ev.until, text: ev.text };
         // 재시도까지 실패한 오류(사용량 한도 등)는 그 답변을 끝낸다
-        if (a === this.claude) { if (this.turnActive || a.state !== 'idle') this.endTurn(null, ev.t, true); }
+        if (a === this.claude) {
+          this.notify('limit', ev.text);
+          if (this.turnActive || a.state !== 'idle') this.endTurn(null, ev.t, true);
+        }
         else if (a.kind === 'sub') { a.resumed = false; this.finishSub(a, { text: ev.text, err: true }); }
         break;
       }
       case 'tasknote': this.onTaskNote(ev); break;
-      case 'compact': this.log(a, '🧹 대화 압축', { t: ev.t }); break;
+      case 'compact': this.log(a, '🧹 대화 압축' + (ev.pre && ev.post ? ` · ${tokens(ev.pre)} → ${tokens(ev.post)} 토큰` : ''), { t: ev.t }); break;
     }
   }
 
@@ -389,7 +413,12 @@ class Town {
       a.say('say', what, 0, ev.id);
       return;
     }
-    if (a.kind === 'sub' && FINAL_TOOLS.has(name)) { a.say('say', what, 0, ev.id); return; }
+    if (a.kind === 'sub' && FINAL_TOOLS.has(name)) {
+      // SubagentHandback에는 서브에이전트가 넘기는 보고 내용이 들어 있다. 보고 말풍선에 그대로 쓴다
+      if (name === 'SubagentHandback' && ev.input.message) a.reportText = ev.input.message;
+      a.say('say', what, 0, ev.id);
+      return;
+    }
     if (name === 'Workflow' && a === this.claude) {
       // 워크플로도 자리에서 전화를 건다. 일할 에이전트들은 각자 기록이 생기면 엘리베이터로 출근한다
       this.goRoom(a, 'desk', () => { a.emote = 'phone'; this.phoneUntil = Date.now() + 2600; });
@@ -407,6 +436,7 @@ class Town {
     if (room === 'ask') {
       this.goRoom(a, 'ask', () => { a.facing = -1; });
       a.say('ask', ev.input.question || '확인할 게 있어요', 0, ev.id);
+      this.notify('ask', ev.input.question || '확인할 게 있어요');
       return;
     }
     if (todosOf(ev)) { this.world.todos = todosOf(ev); }
@@ -495,14 +525,17 @@ class Town {
     if (this.taskNotes.has(key)) return;
     this.taskNotes.add(key);
     const failed = ev.status !== 'completed';
+    const stats = usageText(ev);
     const sub = this.subs.get(ev.id);
-    if (sub) {
-      if (sub.gone || sub.state === 'reporting' || sub.state === 'leaving') return;
+    if (sub && !sub.gone) {
+      // 마지막 보고(SubagentHandback)가 먼저 와서 이미 보고하러 간 뒤면 통계만 로그에 남긴다
+      if (stats) this.log(sub, '📊 작업 통계' + stats, { t: ev.t });
+      if (sub.state === 'reporting' || sub.state === 'leaving') return;
       sub.resumed = false;
       this.finishSub(sub, { text: failed ? ev.text : '', err: failed });
       return;
     }
-    if (ev.text) this.log(this.claude, (failed ? '💦 ' : '✅ ') + ev.text, { t: ev.t, err: failed });
+    if (ev.text) this.log(this.claude, (failed ? '💦 ' : '✅ ') + ev.text + stats, { t: ev.t, err: failed });
   }
 
   finishSub(a, ev) {
@@ -518,9 +551,10 @@ class Town {
     this.walk(a, spot, () => {
       if (a.state !== 'reporting') return;
       a.facing = a.x < this.claude.x ? 1 : -1;
-      a.say(ev.err ? 'err' : 'report', (ev.err ? '죄송해요… ' : '보고: ') + (ev.text || '다 했어요!'), 3200);
+      const said = ev.text || (ev.err ? '' : a.reportText) || '';
+      a.say(ev.err ? 'err' : 'report', (ev.err ? '죄송해요… ' : '보고: ') + (said || '다 했어요!'), 3200);
       if (!ev.err) { a.eyes = 'happy'; this.cheer(); } else a.mouth = 'worried';
-      this.log(a, (ev.err ? '😓 ' : '📋 ') + 'Claude에게 보고', { err: ev.err });
+      this.log(a, (ev.err ? '😓 ' : '📋 ') + 'Claude에게 보고' + (said ? ': ' + short(said, 90) : ''), { err: ev.err });
       this.later(3200, a, () => {
         if (a.state !== 'reporting') return;
         a.say('say', '👋 퇴근합니다!', 2000); a.emote = 'wave';
@@ -550,7 +584,15 @@ class Town {
     this.dirty = true;
   }
 
+  // 화면 밖에서 알아야 할 일(질문, 승인 대기, 답변 완료, 사용량 한도). 지난 기록을 재생하는 동안에는 알리지 않는다
+  notify(kind, text) {
+    if (!this.replaying && this.opts.onNotify) this.opts.onNotify(kind, text);
+  }
+
   endTurn(msg, t, quiet = false) {
+    // 내가 보낸 요청에 NOTIFY_TURN_MS 넘게 걸린 답변이 끝나면 알린다
+    if (!quiet && !msg && this.turnStartedAt && Date.now() - this.turnStartedAt >= NOTIFY_TURN_MS) this.notify('done', this.lastAnswer);
+    this.turnStartedAt = 0;
     this.turnActive = false;
     for (const [id, p] of this.pending) if (p.agent === this.claude) this.pending.delete(id);
     const c = this.claude;
@@ -641,7 +683,11 @@ class Town {
       for (const [id, p] of this.pending) {
         if (p.agent !== c || LONG_TOOLS.has(p.ev.name) || /^mcp__/.test(p.ev.name) || !live || now - p.at <= 7000) continue;
         waitFor = id;
-        if (!p.asked) { p.asked = true; this.log(c, `⏳ 승인 대기 중인 것 같아요: ${p.ev.name}`, { warn: true }); }
+        if (!p.asked) {
+          p.asked = true;
+          this.log(c, `⏳ 승인 대기 중인 것 같아요: ${p.ev.name}`, { warn: true });
+          this.notify('wait', describeTool(p.ev.name, p.ev.input));
+        }
       }
       if (waitFor && !(c.bubble && ALERT_BUBBLES.has(c.bubble.type))) c.say('wait', '승인 기다리는 중일까요?', 0, waitFor);
     }
@@ -811,6 +857,12 @@ async function getJson(url) {
   return r.json();
 }
 
+async function postJson(url, body) {
+  const r = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, cache: 'no-store', body: JSON.stringify(body) });
+  if (!r.ok) throw new Error(r.status + ' ' + url);
+  return r.json();
+}
+
 async function refreshFloors() {
   try {
     const data = await getJson('/api/floors');
@@ -901,7 +953,7 @@ function openSession(f, sid) {
   const themeIndex = themeForFloor(f.floor);
   if (!app.world || app.world.themeIndex !== themeIndex) app.world = buildWorld(themeIndex);
   app.world.todos = [];
-  app.town = new Town(app.world, { userName: app.user, onTitle: t => { app.title = t; renderHeader(); } });
+  app.town = new Town(app.world, { userName: app.user, onTitle: t => { app.title = t; renderHeader(); }, onNotify: notify });
   history.replaceState(null, '', `#floor=${encodeURIComponent(f.id)}${app.autoFollow ? '' : '&session=' + encodeURIComponent(sid)}`);
   renderHeader();
   poll(token, f.id, sid);
@@ -912,8 +964,7 @@ async function poll(token, floorId, sid) {
   while (token === app.sessionToken) {
     let data = null;
     try {
-      const c = app.cursor ? '&c=' + encodeURIComponent(JSON.stringify(app.cursor)) : '';
-      data = await getJson(`/api/session?floor=${encodeURIComponent(floorId)}&session=${encodeURIComponent(sid)}${c}`);
+      data = await postJson('/api/session', { floor: floorId, session: sid, c: app.cursor || null });
     } catch (e) {
       await sleep(1000);
       continue;
@@ -1066,17 +1117,70 @@ function renderAlerts() {
   const people = app.town ? app.town.chars.filter(c => c.kind === 'claude' || c.kind === 'sub') : [];
   const err = people.filter(c => c.alert === 'error').length;
   const att = people.filter(c => c.alert === 'attention').length;
+  // 사용량 한도: 풀리는 시각이 지나면 표지를 거둔다
+  const now = Date.now();
+  const lim = app.town && app.town.limit && app.town.limit.until > now ? app.town.limit : null;
   const box = $('#alerts');
-  const key = err + '/' + att;
+  const key = err + '/' + att + '/' + (lim ? lim.until : 0);
   if (box.dataset.key !== key) {
     box.dataset.key = key;
-    box.innerHTML = (err ? `<span class="chip err">⚠ 오류 ${err}</span>` : '') + (att ? `<span class="chip warn">❓ 확인 필요 ${att}</span>` : '');
+    const at = lim ? new Date(lim.until).toLocaleTimeString('ko-KR', { hour: '2-digit', minute: '2-digit' }) : '';
+    box.innerHTML = (lim ? `<span class="chip limit" title="${esc(lim.text)}">⛔ 사용 한도 · ${at} 재개 <span id="limitLeft" aria-hidden="true"></span></span>` : '') +
+      (err ? `<span class="chip err">⚠ 오류 ${err}</span>` : '') + (att ? `<span class="chip warn">❓ 확인 필요 ${att}</span>` : '');
+  }
+  if (lim) {
+    // 남은 시간은 분 단위로만 고친다 (표지 전체를 다시 그리면 보조기술이 매번 다시 읽는다)
+    const m = Math.ceil((lim.until - now) / 60000);
+    const left = '(' + (m >= 60 ? `${Math.floor(m / 60)}시간 ${m % 60}분` : `${m}분`) + ' 남음)';
+    const el = $('#limitLeft');
+    if (el && el.textContent !== left) el.textContent = left;
   }
   const stage = $('#stage');
   stage.classList.toggle('alert-error', err > 0);
   stage.classList.toggle('alert-attention', !err && att > 0);
-  const title = (err ? '⚠ ' : att ? '❓ ' : '') + BASE_TITLE;
+  const title = (err ? '⚠ ' : att ? '❓ ' : lim ? '⛔ ' : '') + BASE_TITLE;
   if (document.title !== title) document.title = title;
+}
+
+// 오른쪽 패널의 모델 줄: 모델 · 지금 컨텍스트 크기 · 브랜치
+function renderStats() {
+  const st = (app.town && app.town.stats) || {};
+  const text = [st.model, st.ctx ? `컨텍스트 ${tokens(st.ctx)} 토큰` : '', st.branch ? `브랜치 ${st.branch}` : ''].filter(Boolean).join(' · ');
+  const row = $('#statRow');
+  if (row.hidden !== !text) row.hidden = !text;
+  if ($('#stats').textContent !== text) $('#stats').textContent = text;
+}
+
+// -------- 데스크톱 알림 (켜 둔 경우에만, 이 탭을 보고 있지 않을 때만)
+
+const NOTIFY_TITLES = { ask: '❓ Claude가 물어봐요', wait: '⏳ 승인을 기다리는 것 같아요', done: '✅ Claude가 답변을 마쳤어요', limit: '⛔ 사용 한도에 걸렸어요' };
+const canNotify = 'Notification' in window && window.isSecureContext;
+let notifyOn = false;
+function notify(kind, text) {
+  if (!notifyOn || !document.hidden || Notification.permission !== 'granted') return;
+  try {
+    const n = new Notification(NOTIFY_TITLES[kind] || BASE_TITLE, { body: short(text, 120), tag: 'clawd-village-' + kind });
+    n.onclick = () => { window.focus(); n.close(); };
+  } catch { /* 알림을 못 띄우는 환경 */ }
+}
+function setNotify(on) {
+  notifyOn = on;
+  const btn = $('#notifyToggle');
+  const label = on ? '알림 끄기 (지금 켜짐: 이 탭을 안 볼 때 질문·승인 대기·답변 완료·사용 한도를 알려요)' : '알림 켜기 (이 탭을 안 볼 때 질문·승인 대기·답변 완료·사용 한도를 알려요)';
+  btn.title = label; btn.setAttribute('aria-label', label); btn.setAttribute('aria-pressed', String(on));
+  try { localStorage.setItem('clawd-village:notify', on ? '1' : '0'); } catch { /* 저장소를 못 쓰는 브라우저 */ }
+}
+if (canNotify) {
+  $('#notifyToggle').hidden = false;
+  let saved = false;
+  try { saved = localStorage.getItem('clawd-village:notify') === '1'; } catch { /* 저장소를 못 쓰는 브라우저 */ }
+  setNotify(saved && Notification.permission === 'granted');
+  $('#notifyToggle').addEventListener('click', async () => {
+    if (notifyOn) return setNotify(false);
+    const perm = Notification.permission === 'default' ? await Notification.requestPermission() : Notification.permission;
+    if (perm === 'granted') { setNotify(true); toast('알림을 켰어요. 이 탭을 안 볼 때만 알려요'); }
+    else toast('브라우저 설정에서 이 주소의 알림을 허용해 주세요');
+  });
 }
 
 function renderLegend() {
@@ -1106,7 +1210,7 @@ function frame(now) {
     app.town.update(dt, app.sessionActive);
     const live = app.town.liveFlags(app.floor ? app.floor.floor + 'F' : '', app.user);
     render(ctx, app.world, app.cam, app.town.chars, live, now / 1000);
-    if (now - panelAt > 500) { panelAt = now; renderPeople(); renderLogs(); renderAlerts(); }
+    if (now - panelAt > 500) { panelAt = now; renderPeople(); renderLogs(); renderAlerts(); renderStats(); }
   } else {
     ctx.setTransform(1, 0, 0, 1, 0, 0);
     ctx.fillStyle = '#d9f1ff'; ctx.fillRect(0, 0, canvas.width, canvas.height);
