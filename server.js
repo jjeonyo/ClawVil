@@ -149,7 +149,12 @@ function compact(rec, src) {
       if (!c.startsWith('<task-notification')) break;
       const tag = name => { const m = c.match(new RegExp(`<${name}>([\\s\\S]*?)</${name}>`)); return m ? m[1].trim() : ''; };
       const id = tag('tool-use-id');
-      if (id) out.push({ ...base, k: 'tasknote', id, status: tag('status'), text: clip(tag('summary'), 160) });
+      if (!id) break;
+      const ev = { ...base, k: 'tasknote', id, status: tag('status'), text: clip(tag('summary'), 160) };
+      // 서브에이전트·워크플로 알림에는 쓴 토큰, 도구 횟수, 걸린 시간이 붙어 온다
+      const num = name => { const n = Number(tag(name)); return Number.isFinite(n) && n > 0 ? n : undefined; };
+      if (c.includes('<usage>')) { ev.tok = num('subagent_tokens'); ev.tools = num('tool_uses'); ev.ms = num('duration_ms'); }
+      out.push(ev);
       break;
     }
     case 'attachment': {
@@ -185,10 +190,24 @@ function compact(rec, src) {
     case 'assistant': {
       const m = rec.message || {};
       // 재시도까지 실패해 답변 대신 남은 오류(사용량 한도 등). 이걸로 그 답변은 끝난다
-      if (rec.isApiErrorMessage) { out.push({ ...base, k: 'apierr', final: true, text: clip(resultText(m.content), 160) }); break; }
+      if (rec.isApiErrorMessage) {
+        const ev = { ...base, k: 'apierr', final: true, text: clip(resultText(m.content), 160) };
+        // 사용량 한도면 한도가 풀리는 시각(초 단위)이 함께 남는다
+        const reset = Number(rec.quotaLimits && rec.quotaLimits.resetsAt);
+        if (Number.isFinite(reset) && reset > 0) ev.until = reset * 1000;
+        out.push(ev);
+        break;
+      }
       if (!Array.isArray(m.content)) break;
       // mid: 한 번의 API 응답에서 나온 기록끼리 같은 값. 화면에서 Claude의 단계 경계를 가르는 데 쓴다
       const ab = m.id ? { ...base, mid: m.id } : base;
+      // 메인 세션의 모델과 지금 컨텍스트 크기(이 응답에 들어간 입력 토큰). 브랜치는 이름을 모를 때 HEAD로 남는다
+      const u = m.usage;
+      if (src === 'main' && !rec.isSidechain && u && typeof u.input_tokens === 'number') {
+        const ctx = u.input_tokens + (u.cache_read_input_tokens || 0) + (u.cache_creation_input_tokens || 0);
+        const br = typeof rec.gitBranch === 'string' && rec.gitBranch !== 'HEAD' ? clip(rec.gitBranch, 40) : undefined;
+        if (ctx > 0) out.push({ ...base, k: 'usage', ctx, model: typeof m.model === 'string' ? clip(m.model, 40) : '', br });
+      }
       for (const b of m.content) {
         if (!b) continue;
         if (b.type === 'thinking') out.push({ ...ab, k: 'think', text: clip(b.thinking || '', 280) });
@@ -201,7 +220,10 @@ function compact(rec, src) {
     case 'system':
       if (rec.subtype === 'stop_hook_summary' || rec.subtype === 'turn_duration') out.push({ ...base, k: 'stop' });
       else if (rec.subtype === 'api_error') out.push({ ...base, k: 'apierr', text: clip(rec.content || 'API 오류', 160) });
-      else if (rec.subtype === 'compact_boundary') out.push({ ...base, k: 'compact' });
+      else if (rec.subtype === 'compact_boundary') {
+        const cm = rec.compactMetadata || {};
+        out.push({ ...base, k: 'compact', pre: Number(cm.preTokens) || undefined, post: Number(cm.postTokens) || undefined });
+      }
       break;
   }
   return out;
@@ -211,12 +233,15 @@ function compact(rec, src) {
 
 const infoCache = new Map();
 
+// 제목은 사용자가 붙인 이름 → 가장 최근 요청 → 첫 요청 순으로 고른다
 function sessionInfo(file, st) {
   const hit = infoCache.get(file);
   if (hit && hit.size === st.size && hit.mtime === st.mtimeMs) return hit.info;
-  const info = { title: '', cwd: '', birth: st.birthtimeMs || st.mtimeMs, hasMessages: false, customTitle: '' };
+  // 앞부분(HEAD_BYTES)이 이미 다 찬 파일이 커지기만 했으면 앞부분은 그대로다. 끝부분만 다시 읽는다
+  const grown = hit && st.size > hit.size && hit.size >= HEAD_BYTES;
+  const info = grown ? { ...hit.info } : { first: '', last: '', title: '', cwd: '', birth: st.birthtimeMs || st.mtimeMs, hasMessages: false, customTitle: '' };
   try {
-    const recs = headRecords(file, st.size);
+    const recs = grown ? [] : headRecords(file, st.size);
     if (st.size > HEAD_BYTES) recs.push(...tailRecords(file, st.size, HEAD_BYTES));
     let firstTs = null;
     for (const r of recs) {
@@ -224,13 +249,17 @@ function sessionInfo(file, st) {
       if (!info.cwd && r.cwd) info.cwd = r.cwd;
       if (!firstTs && r.timestamp) firstTs = Date.parse(r.timestamp);
       if (r.type === 'custom-title' && r.customTitle) info.customTitle = r.customTitle;
-      if (!info.title && r.type === 'user' && !r.isMeta && !r.isSidechain) {
+      if (r.type === 'last-prompt' && typeof r.lastPrompt === 'string') {
+        const p = cleanPrompt(r.lastPrompt);
+        if (p.text) info.last = clip(p.text, 60);
+      }
+      if (!info.first && r.type === 'user' && !r.isMeta && !r.isSidechain) {
         const p = cleanPrompt(userText(r.message && r.message.content));
-        if (p.text) info.title = clip(p.text, 60);
+        if (p.text) info.first = clip(p.text, 60);
       }
     }
-    if (firstTs) info.birth = firstTs;
-    if (info.customTitle) info.title = clip(info.customTitle, 60);
+    if (firstTs && !grown) info.birth = firstTs;
+    info.title = info.customTitle ? clip(info.customTitle, 60) : (info.last || info.first);
   } catch { /* 읽는 도중 지워진 파일 */ }
   infoCache.set(file, { size: st.size, mtime: st.mtimeMs, info });
   return info;
