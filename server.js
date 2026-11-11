@@ -26,6 +26,9 @@ const SUB_INITIAL_TAIL = 128 * 1024;
 const SUB_RECENT_MS = 30 * 60 * 1000;  // 처음 열 때 이 시간 안에 쓰인 서브에이전트 기록만 읽는다
 const MAX_CHUNK = 4 * 1024 * 1024;     // 한 번의 폴링에서 읽는 최대 바이트
 const HEAD_BYTES = 64 * 1024;
+const BODY_MAX = 1024 * 1024;          // POST 본문 한도
+const FLOORS_TTL = 1500;               // 탭들이 층 목록을 이 시간 동안 함께 쓴다
+const CACHE_MAX = 20000;               // 캐시가 이보다 커지면 비운다
 const NAME_RE = /^[A-Za-z0-9._-]+$/;
 
 function userName() {
@@ -276,6 +279,7 @@ function listFloors() {
   catch { return []; }
   const now = Date.now();
   const floors = [];
+  const seen = new Set();
   for (const d of dirs) {
     const dir = path.join(ROOT, d.name);
     let files;
@@ -298,6 +302,7 @@ function listFloors() {
       const file = path.join(dir, f.name);
       let st;
       try { st = fs.statSync(file); } catch { continue; }
+      seen.add(file);
       const info = sessionInfo(file, st);
       if (!info.hasMessages) continue;
       // 하루 넘게 조용한 세션은 서브에이전트 폴더까지 뒤지지 않는다
@@ -317,6 +322,8 @@ function listFloors() {
       sessions: sessions.slice(0, 30).map(({ cwd: _c, ...s }) => s),
     });
   }
+  // 이번 훑기에서 안 보인 세션 파일은 캐시에서 뺀다 (지워진 파일이 쌓이지 않게)
+  for (const k of infoCache.keys()) if (!seen.has(k)) infoCache.delete(k);
   floors.sort((a, b) => a.firstSeen - b.firstSeen || a.id.localeCompare(b.id));
   floors.forEach((f, i) => { f.floor = i + 1; });
   return floors;
@@ -328,7 +335,8 @@ const sideHeadCache = new Map();
 
 function subagentHead(file, st) {
   const hit = sideHeadCache.get(file);
-  if (hit && hit.size === st.size) return hit.head;
+  // 기록은 뒤에만 덧붙으므로 파일이 줄지 않았다면 머리말은 그대로다
+  if (hit && st.size >= hit.size) return hit.head;
   const head = { sessionId: '', prompt: '', agentId: '' };
   try {
     for (const r of headRecords(file, st.size)) {
@@ -342,7 +350,10 @@ function subagentHead(file, st) {
     }
   } catch { /* 무시 */ }
   // 첫 프롬프트가 아직 안 써졌으면 다음에 다시 읽는다
-  if (head.prompt) sideHeadCache.set(file, { size: st.size, head });
+  if (head.prompt) {
+    sideHeadCache.set(file, { size: st.size, head });
+    if (sideHeadCache.size > CACHE_MAX) sideHeadCache.clear();
+  }
   return head;
 }
 
@@ -350,24 +361,41 @@ function readMeta(file) {
   try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch { return null; }
 }
 
+// 예전 형식 파일이 어느 세션 것인지. 파일의 세션 번호는 바뀌지 않으므로 한 번 알면 다시 확인하지 않는다.
+const legacySessionOf = new Map();
+
 function findSubagents(floorDir, sessionId) {
   const subs = [];
-  for (const s of subagentFiles(floorDir, sessionId)) {
-    const meta = readMeta(s.file.replace(/\.jsonl$/, '.meta.json'));
-    subs.push({ key: s.name.slice(0, -6), file: s.file, agentType: meta && (meta.agentType || meta.subagent_type), wf: s.wf,
-      desc: meta && meta.description, toolUseId: meta && typeof meta.toolUseId === 'string' ? meta.toolUseId : null });
-  }
+  for (const s of subagentFiles(floorDir, sessionId)) subs.push({ key: s.name.slice(0, -6), file: s.file, wf: s.wf });
   // 예전 버전: 프로젝트 폴더에 agent-*.jsonl 로 섞여 있다
   try {
     for (const f of fs.readdirSync(floorDir)) {
       if (!f.startsWith('agent-') || !f.endsWith('.jsonl') || !NAME_RE.test(f)) continue;
       const file = path.join(floorDir, f);
+      const known = legacySessionOf.get(file);
+      if (known && known !== sessionId) continue;
       let st;
       try { st = fs.statSync(file); } catch { continue; }
-      if (subagentHead(file, st).sessionId === sessionId) subs.push({ key: f.slice(0, -6), file });
+      const sid = subagentHead(file, st).sessionId;
+      if (sid) {
+        if (legacySessionOf.size > CACHE_MAX) legacySessionOf.clear();
+        legacySessionOf.set(file, sid);
+      }
+      if (sid === sessionId) subs.push({ key: f.slice(0, -6), file, wf: null, legacy: true });
     }
   } catch { /* 무시 */ }
   return subs;
+}
+
+// 서브에이전트 하나의 표시 정보. 메타 파일은 이 항목을 보낼 때만 읽는다 (예전 형식은 메타를 보지 않는다)
+function subEntry(sub, st) {
+  const head = subagentHead(sub.file, st);
+  const meta = sub.legacy ? null : readMeta(sub.file.replace(/\.jsonl$/, '.meta.json'));
+  const desc = meta && meta.description;
+  const e = { prompt: head.prompt, agentId: head.agentId, agentType: (meta && (meta.agentType || meta.subagent_type)) || '', mtime: st.mtimeMs,
+    desc: typeof desc === 'string' ? clip(desc, 40) : '', toolUseId: (meta && typeof meta.toolUseId === 'string' && meta.toolUseId) || undefined };
+  if (sub.wf) e.wf = sub.wf;
+  return e;
 }
 
 // ---------------------------------------------------------------- 증분 읽기
@@ -377,11 +405,14 @@ function readNew(file, offset, initialTail) {
   const st = fs.statSync(file);
   let start = offset;
   let reset = false;
+  let pre = null;  // 첫 줄을 찾으려고 읽은 구간. 같은 바이트를 두 번 읽지 않으려고 남겨 둔다
   if (start == null) {
     start = initialTail == null ? 0 : Math.max(0, st.size - initialTail);
     if (start > 0) {
-      const probe = readRange(file, start, Math.min(st.size, start + MAX_CHUNK));
-      const nl = probe.indexOf(0x0a);
+      const at = start;
+      const buf = readRange(file, at, Math.min(st.size, at + MAX_CHUNK));
+      pre = { at, buf };
+      const nl = buf.indexOf(0x0a);
       start = nl >= 0 ? start + nl + 1 : st.size;
     }
   } else if (start > st.size) { start = 0; reset = true; }
@@ -389,7 +420,13 @@ function readNew(file, offset, initialTail) {
   // more: MAX_CHUNK에서 끊어 읽어 뒤에 더 읽을 줄이 남았다. 마지막 줄이 아직 덜 쓰였을 뿐이면 false다
   const more = end < st.size;
   if (end <= start) return { offset: start, records: [], reset, more: false, size: st.size, mtime: st.mtimeMs };
-  const buf = readRange(file, start, end);
+  let buf;
+  if (pre) {
+    // 앞부분은 이미 읽은 것을 쓰고, 모자란 뒤쪽만 더 읽는다
+    const have = pre.buf.subarray(start - pre.at);
+    const preEnd = pre.at + pre.buf.length;
+    buf = end <= preEnd ? have.subarray(0, end - start) : Buffer.concat([have, readRange(file, preEnd, end)]);
+  } else buf = readRange(file, start, end);
   const nl = buf.lastIndexOf(0x0a);
   if (nl < 0) {
     // 줄 하나가 MAX_CHUNK보다 크면 그 줄은 버리고 다음 줄부터 읽는다
@@ -418,13 +455,14 @@ function sessionDelta(floorId, sessionId, cursor) {
       const st = fs.statSync(sub.file);
       if (!st.isFile()) continue;
       lastWrite = Math.max(lastWrite, st.mtimeMs);
-      const head = subagentHead(sub.file, st);
-      subsMeta[sub.key] = { prompt: head.prompt, agentId: head.agentId, agentType: sub.agentType || '', mtime: st.mtimeMs,
-        desc: typeof sub.desc === 'string' ? clip(sub.desc, 40) : '', toolUseId: sub.toolUseId || undefined };
-      if (sub.wf) subsMeta[sub.key].wf = sub.wf;
       let off = prevSubs[sub.key];
+      const known = typeof off === 'number';
+      // 클라이언트가 이미 끝까지 읽은 파일은 머리말·메타·읽기 없이 위치만 넘긴다
+      if (known && off === st.size) { nextSubs[sub.key] = off; continue; }
+      // 클라이언트가 처음 보는 서브에이전트는 표시 정보를 함께 보낸다
+      if (!known) subsMeta[sub.key] = subEntry(sub, st);
       let tail = null;
-      if (typeof off !== 'number') {
+      if (!known) {
         if (initial) {
           // 처음 열 때: 끝난 지 오래된 서브에이전트는 건너뛰고, 최근 것만 끝부분을 읽는다.
           // 긴 명령을 기다리는 동안에는 기록이 멈추므로 넉넉하게 30분까지 본다.
@@ -433,6 +471,7 @@ function sessionDelta(floorId, sessionId, cursor) {
       }
       const r = readNew(sub.file, off, tail);
       nextSubs[sub.key] = r.offset;
+      if (known && r.records.length) subsMeta[sub.key] = subEntry(sub, st);
       for (const rec of r.records) events.push(...compact(rec, 'sub:' + sub.key));
     } catch {
       // 이 서브에이전트만 건너뛰되, 읽던 위치는 지켜 다음에 처음부터 다시 읽지 않게 한다
@@ -472,6 +511,40 @@ function serveStatic(req, res, pathname) {
   });
 }
 
+let floorsCache = { at: 0, floors: null };
+
+// GET(쿼리)과 POST(본문)가 같이 쓰는 세션 응답
+function answerSession(res, floor, session, cursor) {
+  if (!validName(floor) || !validName(session)) return sendJson(res, 400, { error: 'bad name' });
+  if (!fs.existsSync(path.join(ROOT, floor, session + '.jsonl'))) return sendJson(res, 404, { error: 'no session' });
+  return sendJson(res, 200, sessionDelta(floor, session, cursor));
+}
+
+// 요청 본문을 JSON으로 읽어 넘긴다. 1 MiB를 넘으면 413, JSON이 아니면 400, 처리 중 오류는 500
+function readJsonBody(req, res, handle) {
+  const chunks = [];
+  let size = 0;
+  let done = false;
+  req.on('error', () => { done = true; });
+  req.on('data', c => {
+    if (done) return;
+    size += c.length;
+    if (size <= BODY_MAX) { chunks.push(c); return; }
+    done = true;
+    res.writeHead(413, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store', Connection: 'close' });
+    res.end('{"error":"too large"}');
+  });
+  req.on('end', () => {
+    if (done) return;
+    done = true;
+    let body;
+    try { body = JSON.parse(Buffer.concat(chunks).toString('utf8')); } catch { return sendJson(res, 400, { error: 'bad json' }); }
+    try { handle(body); } catch (e) {
+      if (!res.headersSent) sendJson(res, 500, { error: String(e && e.message || e) });
+    }
+  });
+}
+
 const server = http.createServer((req, res) => {
   // 다른 사이트가 이 서버를 읽어 가지 못하도록 Host 헤더를 확인한다 (DNS 리바인딩 방지).
   // localhost 같은 이름은 이 PC 안에서 온 연결에만 허용한다. 다른 기기는 Host를 마음대로 적을 수 있으므로
@@ -486,17 +559,26 @@ const server = http.createServer((req, res) => {
     let url;
     try { url = new URL(req.url, 'http://localhost'); } catch { return sendJson(res, 400, { error: 'bad url' }); }
     if (url.pathname === '/api/floors') {
-      return sendJson(res, 200, { root: ROOT, user: userName(), demo: !!args.demo, now: Date.now(), floors: listFloors() });
+      // 탭마다 따로 훑지 않도록 목록을 잠깐 함께 쓴다
+      const t = Date.now();
+      if (!floorsCache.floors || t - floorsCache.at >= FLOORS_TTL) floorsCache = { at: t, floors: listFloors() };
+      return sendJson(res, 200, { root: ROOT, user: userName(), demo: !!args.demo, now: Date.now(), floors: floorsCache.floors });
+    }
+    if (url.pathname === '/api/session' && req.method === 'POST') {
+      // 커서를 주소에 실으면 서브에이전트가 많을 때 431이 나므로 본문으로 받는다
+      if (!(req.headers['content-type'] || '').toLowerCase().startsWith('application/json')) return sendJson(res, 415, { error: 'json only' });
+      return readJsonBody(req, res, b => {
+        const o = b && typeof b === 'object' ? b : {};
+        return answerSession(res, typeof o.floor === 'string' ? o.floor : '', typeof o.session === 'string' ? o.session : '', o.c || null);
+      });
     }
     if (url.pathname === '/api/session') {
       const floor = url.searchParams.get('floor') || '';
       const session = url.searchParams.get('session') || '';
-      if (!validName(floor) || !validName(session)) return sendJson(res, 400, { error: 'bad name' });
       let cursor = null;
       const c = url.searchParams.get('c');
       if (c) { try { cursor = JSON.parse(c); } catch { return sendJson(res, 400, { error: 'bad cursor' }); } }
-      if (!fs.existsSync(path.join(ROOT, floor, session + '.jsonl'))) return sendJson(res, 404, { error: 'no session' });
-      return sendJson(res, 200, sessionDelta(floor, session, cursor));
+      return answerSession(res, floor, session, cursor);
     }
     if (req.method !== 'GET') { res.writeHead(405); return res.end(); }
     return serveStatic(req, res, url.pathname);

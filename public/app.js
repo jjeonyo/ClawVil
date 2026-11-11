@@ -811,6 +811,12 @@ async function getJson(url) {
   return r.json();
 }
 
+async function postJson(url, body) {
+  const r = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, cache: 'no-store', body: JSON.stringify(body) });
+  if (!r.ok) throw new Error(r.status + ' ' + url);
+  return r.json();
+}
+
 async function refreshFloors() {
   try {
     const data = await getJson('/api/floors');
@@ -912,8 +918,7 @@ async function poll(token, floorId, sid) {
   while (token === app.sessionToken) {
     let data = null;
     try {
-      const c = app.cursor ? '&c=' + encodeURIComponent(JSON.stringify(app.cursor)) : '';
-      data = await getJson(`/api/session?floor=${encodeURIComponent(floorId)}&session=${encodeURIComponent(sid)}${c}`);
+      data = await postJson('/api/session', { floor: floorId, session: sid, c: app.cursor || null });
     } catch (e) {
       await sleep(1000);
       continue;
