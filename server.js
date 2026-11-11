@@ -508,8 +508,11 @@ function sessionDelta(floorId, sessionId, cursor) {
     }
   }
   events.sort((a, b) => (a.t || 0) - (b.t || 0));
+  // 모델·컨텍스트 정보는 가장 최근 것 하나만 있으면 된다
+  const lastUsage = events.map(e => e.k).lastIndexOf('usage');
+  const sent = events.filter((e, i) => e.k !== 'usage' || i === lastUsage);
   return {
-    events,
+    events: sent,
     initial,
     reset: main.reset,
     cursor: { m: main.offset, s: nextSubs },
