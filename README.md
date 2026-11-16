@@ -182,16 +182,24 @@ node server.js --demo
 ## 파일 구조
 
 ```text
-server.js            세션 목록 · jsonl 증분 읽기 API, 정적 파일 서버
+server.js            실행 옵션, HTTP (API와 정적 파일)
+lib/
+├── events.js        기록 한 줄 → 이벤트. 서버와 화면이 주고받는 이벤트 종류와 필드가 머리말에 있다
+└── sessions.js      층 · 세션 목록, 서브에이전트 기록 찾기, 이어 읽기
 demo.js              --demo 용 가짜 세션 작성기
-package.json         npm start / npm run demo 스크립트 (의존성 없음)
+package.json         npm start / npm run demo / npm test 스크립트 (의존성 없음)
+test/                node --test 로 도는 테스트 (서버 쪽, 그리고 화면의 캐릭터 로직)
 .coderabbit.yaml     CodeRabbit 리뷰 설정 (한국어, 초안 PR 포함)
 public/
 ├── index.html       화면 틀
 ├── style.css        패널과 UI 스타일
-├── app.js           기록 → 캐릭터 행동, 층 안내 · 사람 목록 · 활동 로그 · 오류 표지
+├── app.js           시작점: 서버 통신, 카메라, 층 안내 · 사람 목록 · 활동 로그 · 오류 표지 · 알림
+├── town.js          이벤트 → 캐릭터 행동 (화면을 건드리지 않아 Node에서도 돈다)
+├── tools.js         도구 → 방, 말풍선 문구, 오래 걸리는 도구 목록
+├── util.js          문자열 · 시간 · 토큰 표기 도우미
 ├── world.js         지형, 방과 소품, 길찾기, 말풍선, 렌더링
 ├── critters.js      캐릭터와 경고 고리 · 표지 그리기
-└── art.js           등각 좌표, 음영 블록, 스프라이트 캐시
+├── art.js           등각 좌표, 음영 블록, 스프라이트 캐시
+└── package.json     이 폴더의 .js가 ES 모듈임을 Node에 알린다 (테스트에서 불러 쓰려고)
 docs/                README 이미지
 ```
