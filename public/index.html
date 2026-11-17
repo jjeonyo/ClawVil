@@ -27,6 +27,7 @@
         <div class="status">
           <span id="alerts" role="status"></span>
           <span id="live" class="live"><i></i><span>…</span></span>
+          <button id="notifyToggle" class="bell" type="button" aria-pressed="false" hidden></button>
         </div>
       </div>
       <canvas id="town"></canvas>
@@ -50,6 +51,7 @@
       <section class="meta">
         <div><small>프로젝트</small><span id="cwd"></span></div>
         <div><small>세션</small><span id="sid"></span></div>
+        <div id="statRow" hidden><small>모델</small><span id="stats"></span></div>
       </section>
       <section>
         <header class="sign small"><span>사무실 사람들</span><small id="peopleCount"></small></header>

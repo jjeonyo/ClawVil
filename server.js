@@ -1,12 +1,14 @@
 #!/usr/bin/env node
 // 클로드봇 마을 — Claude Code 세션 기록(jsonl)을 따라 읽어 블록 마을로 보여주는 로컬 서버.
 // 외부 패키지 없음. 훅/설정을 건드리지 않고 ~/.claude/projects 아래 파일을 읽기만 한다.
+// 이 파일은 실행 옵션과 HTTP만 맡는다. 기록을 읽는 일은 lib/sessions.js, 기록을 이벤트로 바꾸는 일은 lib/events.js에 있다.
 'use strict';
 
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
+const { validName, listFloors, sessionDelta } = require('./lib/sessions');
 
 const args = parseArgs(process.argv.slice(2));
 const PORT = Number(args.port || process.env.PORT || 4848);
@@ -20,20 +22,12 @@ let ROOT = args.dir || process.env.CLAUDE_PROJECTS_DIR ||
   path.join(process.env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), '.claude'), 'projects');
 if (args.demo) ROOT = require('./demo').start();
 
-const ACTIVE_MS = 2 * 60 * 1000;       // 마지막 기록 후 이 시간 안이면 "불 켜진" 세션
-const INITIAL_TAIL = 2 * 1024 * 1024;      // 처음 열 때 메인 세션 끝부분만 읽는다
-const SUB_INITIAL_TAIL = 128 * 1024;
-const SUB_RECENT_MS = 30 * 60 * 1000;  // 처음 열 때 이 시간 안에 쓰인 서브에이전트 기록만 읽는다
-const MAX_CHUNK = 4 * 1024 * 1024;     // 한 번의 폴링에서 읽는 최대 바이트
-const HEAD_BYTES = 64 * 1024;
-const NAME_RE = /^[A-Za-z0-9._-]+$/;
+const BODY_MAX = 1024 * 1024;          // POST 본문 한도
+const FLOORS_TTL = 1500;               // 탭들이 층 목록을 이 시간 동안 함께 쓴다
 
 function userName() {
   try { return os.userInfo().username; } catch { return process.env.USER || process.env.USERNAME || 'me'; }
 }
-
-// 폴더·세션 이름으로 받아도 되는 값인가 ('.'·'..'는 상위 폴더를 가리키므로 안 된다)
-const validName = s => NAME_RE.test(s) && s !== '.' && s !== '..';
 
 function parseArgs(argv) {
   const out = {};
@@ -47,407 +41,6 @@ function parseArgs(argv) {
     if (next && !next.startsWith('--')) { out[key] = next; i++; } else out[key] = true;
   }
   return out;
-}
-
-// ---------------------------------------------------------------- 파일 읽기 도우미
-
-function readRange(file, start, end) {
-  const len = Math.max(0, end - start);
-  const buf = Buffer.alloc(len);
-  if (!len) return buf;
-  const fd = fs.openSync(file, 'r');
-  try { fs.readSync(fd, buf, 0, len, start); } finally { fs.closeSync(fd); }
-  return buf;
-}
-
-function parseLines(buf) {
-  const out = [];
-  for (const line of buf.toString('utf8').split('\n')) {
-    if (!line.trim()) continue;
-    try { out.push(JSON.parse(line)); } catch { /* 잘린 줄은 무시 */ }
-  }
-  return out;
-}
-
-function headRecords(file, size) {
-  const buf = readRange(file, 0, Math.min(size, HEAD_BYTES));
-  const nl = buf.lastIndexOf(0x0a);
-  return parseLines(nl >= 0 ? buf.subarray(0, nl) : buf);
-}
-
-function tailRecords(file, size, bytes) {
-  const start = Math.max(0, size - bytes);
-  let buf = readRange(file, start, size);
-  if (start > 0) { const nl = buf.indexOf(0x0a); buf = nl >= 0 ? buf.subarray(nl + 1) : Buffer.alloc(0); }
-  return parseLines(buf);
-}
-
-// ---------------------------------------------------------------- 텍스트 정리
-
-function clip(s, n) {
-  if (typeof s !== 'string') return '';
-  s = s.replace(/\s+/g, ' ').trim();
-  return s.length > n ? s.slice(0, n - 1) + '…' : s;
-}
-
-// 사용자 메시지에서 실제 프롬프트만 골라낸다. 명령(/clear 등)과 시스템 주입문은 걸러낸다.
-function cleanPrompt(text) {
-  if (typeof text !== 'string') return {};
-  const t = text.trim();
-  const cmd = t.match(/<command-name>\s*([^<]+?)\s*<\/command-name>/);
-  if (cmd) return { cmd: cmd[1] };
-  if (t.startsWith('[Request interrupted')) return { interrupt: true };
-  if (/^<(local-command|system-reminder|bash-|task-notification|user-prompt-submit-hook)/.test(t)) return {};
-  if (t.startsWith('Caveat:')) return {};
-  const stripped = t.replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, '').trim();
-  return stripped ? { text: stripped } : {};
-}
-
-function userText(content) {
-  if (typeof content === 'string') return content;
-  if (!Array.isArray(content)) return '';
-  if (content.some(b => b && b.type === 'tool_result')) return '';
-  return content.map(b => (b && b.type === 'text' ? b.text : b && b.type === 'image' ? '[이미지]' : '')).join(' ');
-}
-
-function resultText(content) {
-  if (typeof content === 'string') return content;
-  if (Array.isArray(content)) return content.map(b => (b && b.type === 'text' ? b.text : '')).join(' ');
-  return '';
-}
-
-const INPUT_KEYS = ['description', 'command', 'file_path', 'notebook_path', 'path', 'pattern', 'glob',
-  'url', 'query', 'subagent_type', 'skill', 'prompt', 'message', 'to'];
-
-function compactInput(name, input) {
-  const out = {};
-  if (!input || typeof input !== 'object') return out;
-  for (const k of INPUT_KEYS) if (typeof input[k] === 'string') out[k] = clip(input[k], k === 'prompt' ? 300 : 160);
-  if (Array.isArray(input.todos)) {
-    out.todos = input.todos.slice(0, 10).map(t => ({ c: clip(t.content || t.subject || '', 60), s: t.status || 'pending' }));
-  }
-  if (Array.isArray(input.questions) && input.questions[0]) out.question = clip(input.questions[0].question, 160);
-  if (typeof input.subject === 'string') out.subject = clip(input.subject, 80);
-  if (!Object.keys(out).length) {
-    for (const v of Object.values(input)) if (typeof v === 'string') { out.arg = clip(v, 120); break; }
-  }
-  return out;
-}
-
-// jsonl 한 줄 → 화면에 필요한 작은 이벤트들
-function compact(rec, src) {
-  const out = [];
-  if (!rec || typeof rec !== 'object') return out;
-  const base = { src, t: rec.timestamp ? Date.parse(rec.timestamp) : null };
-  if (rec.isSidechain) base.side = true;
-  if (rec.agentId) base.agentId = rec.agentId;
-
-  switch (rec.type) {
-    case 'queue-operation': {
-      // 백그라운드 작업(서브에이전트·워크플로·명령)이 끝났다는 알림. 호출 결과는 시작할 때 이미 왔으므로 진짜 끝은 이것으로 안다
-      const c = rec.operation === 'enqueue' && typeof rec.content === 'string' ? rec.content.trim() : '';
-      if (!c.startsWith('<task-notification')) break;
-      const tag = name => { const m = c.match(new RegExp(`<${name}>([\\s\\S]*?)</${name}>`)); return m ? m[1].trim() : ''; };
-      const id = tag('tool-use-id');
-      if (id) out.push({ ...base, k: 'tasknote', id, status: tag('status'), text: clip(tag('summary'), 160) });
-      break;
-    }
-    case 'attachment': {
-      // Claude가 일하는 도중 내가 보낸 메시지는 사용자 기록이 아니라 이 첨부로만 남는다
-      const a = rec.attachment;
-      if (!a || a.type !== 'queued_command' || a.commandMode !== 'prompt' || rec.isMeta) break;
-      if (!(a.origin ? a.origin.kind === 'human' : a.humanTurn)) break;
-      const p = cleanPrompt(typeof a.prompt === 'string' ? a.prompt : '');
-      if (p.text) out.push({ ...base, k: 'prompt', text: clip(p.text, 300), queued: true });
-      break;
-    }
-    case 'custom-title':
-      if (rec.customTitle) out.push({ ...base, k: 'title', text: clip(rec.customTitle, 80) });
-      break;
-    case 'user': {
-      if (rec.isMeta || rec.isCompactSummary) break;
-      const c = rec.message && rec.message.content;
-      if (Array.isArray(c)) {
-        const tur = rec.toolUseResult && typeof rec.toolUseResult === 'object' ? rec.toolUseResult : null;
-        for (const b of c) {
-          if (!b || b.type !== 'tool_result') continue;
-          out.push({ ...base, k: 'result', id: b.tool_use_id, err: !!b.is_error,
-            text: clip(resultText(b.content), 240), agent: tur && tur.agentId ? String(tur.agentId) : undefined,
-            async: !!(tur && (tur.isAsync || tur.status === 'async_launched')) });
-        }
-      }
-      const p = cleanPrompt(userText(c));
-      if (p.cmd) out.push({ ...base, k: 'command', text: p.cmd });
-      else if (p.interrupt) out.push({ ...base, k: 'interrupt' });
-      else if (p.text) out.push({ ...base, k: 'prompt', text: clip(p.text, 300) });
-      break;
-    }
-    case 'assistant': {
-      const m = rec.message || {};
-      // 재시도까지 실패해 답변 대신 남은 오류(사용량 한도 등). 이걸로 그 답변은 끝난다
-      if (rec.isApiErrorMessage) { out.push({ ...base, k: 'apierr', final: true, text: clip(resultText(m.content), 160) }); break; }
-      if (!Array.isArray(m.content)) break;
-      // mid: 한 번의 API 응답에서 나온 기록끼리 같은 값. 화면에서 Claude의 단계 경계를 가르는 데 쓴다
-      const ab = m.id ? { ...base, mid: m.id } : base;
-      for (const b of m.content) {
-        if (!b) continue;
-        if (b.type === 'thinking') out.push({ ...ab, k: 'think', text: clip(b.thinking || '', 280) });
-        else if (b.type === 'redacted_thinking') out.push({ ...ab, k: 'think', text: '' });
-        else if (b.type === 'text' && b.text && b.text.trim()) out.push({ ...ab, k: 'text', text: clip(b.text, 400), stop: m.stop_reason || null });
-        else if (b.type === 'tool_use') out.push({ ...ab, k: 'tool', id: b.id, name: b.name, input: compactInput(b.name, b.input) });
-      }
-      break;
-    }
-    case 'system':
-      if (rec.subtype === 'stop_hook_summary' || rec.subtype === 'turn_duration') out.push({ ...base, k: 'stop' });
-      else if (rec.subtype === 'api_error') out.push({ ...base, k: 'apierr', text: clip(rec.content || 'API 오류', 160) });
-      else if (rec.subtype === 'compact_boundary') out.push({ ...base, k: 'compact' });
-      break;
-  }
-  return out;
-}
-
-// ---------------------------------------------------------------- 세션 목록
-
-const infoCache = new Map();
-
-function sessionInfo(file, st) {
-  const hit = infoCache.get(file);
-  if (hit && hit.size === st.size && hit.mtime === st.mtimeMs) return hit.info;
-  const info = { title: '', cwd: '', birth: st.birthtimeMs || st.mtimeMs, hasMessages: false, customTitle: '' };
-  try {
-    const recs = headRecords(file, st.size);
-    if (st.size > HEAD_BYTES) recs.push(...tailRecords(file, st.size, HEAD_BYTES));
-    let firstTs = null;
-    for (const r of recs) {
-      if (r.type === 'user' || r.type === 'assistant') info.hasMessages = true;
-      if (!info.cwd && r.cwd) info.cwd = r.cwd;
-      if (!firstTs && r.timestamp) firstTs = Date.parse(r.timestamp);
-      if (r.type === 'custom-title' && r.customTitle) info.customTitle = r.customTitle;
-      if (!info.title && r.type === 'user' && !r.isMeta && !r.isSidechain) {
-        const p = cleanPrompt(userText(r.message && r.message.content));
-        if (p.text) info.title = clip(p.text, 60);
-      }
-    }
-    if (firstTs) info.birth = firstTs;
-    if (info.customTitle) info.title = clip(info.customTitle, 60);
-  } catch { /* 읽는 도중 지워진 파일 */ }
-  infoCache.set(file, { size: st.size, mtime: st.mtimeMs, info });
-  return info;
-}
-
-// 세션 폴더의 서브에이전트 기록 파일들. 워크플로가 띄운 에이전트는 subagents/workflows/<실행 ID>/agent-*.jsonl 에 있다
-function subagentFiles(floorDir, sessionId) {
-  const out = [];
-  const dir = path.join(floorDir, sessionId, 'subagents');
-  try {
-    for (const f of fs.readdirSync(dir)) {
-      if (f.endsWith('.jsonl') && NAME_RE.test(f)) out.push({ name: f, file: path.join(dir, f), wf: null });
-    }
-  } catch { /* 하위 폴더 없음 */ }
-  try {
-    for (const wf of fs.readdirSync(path.join(dir, 'workflows'))) {
-      if (!NAME_RE.test(wf)) continue;
-      try {
-        for (const f of fs.readdirSync(path.join(dir, 'workflows', wf))) {
-          if (f.startsWith('agent-') && f.endsWith('.jsonl') && NAME_RE.test(f)) out.push({ name: f, file: path.join(dir, 'workflows', wf, f), wf });
-        }
-      } catch { /* 폴더가 아님 */ }
-    }
-  } catch { /* 워크플로 없음 */ }
-  return out;
-}
-
-// 세션의 서브에이전트 기록 가운데 가장 최근에 바뀐 시각. 서브에이전트만 일하는 동안에도 불이 켜져 있게 한다.
-function newestSubagentWrite(floorDir, sessionId, oldFormat) {
-  let newest = 0;
-  for (const s of subagentFiles(floorDir, sessionId)) {
-    try { newest = Math.max(newest, fs.statSync(s.file).mtimeMs); } catch { /* 지워짐 */ }
-  }
-  return Math.max(newest, oldFormat.get(sessionId) || 0);
-}
-
-// 디렉터리 이름(-Users-me-work-app)에서 경로를 대충 복원한다. 실제 cwd가 기록에 있으면 그걸 쓴다.
-function guessCwd(dirName) { return dirName.replace(/-/g, '/'); }
-
-function listFloors() {
-  let dirs = [];
-  try { dirs = fs.readdirSync(ROOT, { withFileTypes: true }).filter(d => d.isDirectory() && NAME_RE.test(d.name)); }
-  catch { return []; }
-  const now = Date.now();
-  const floors = [];
-  for (const d of dirs) {
-    const dir = path.join(ROOT, d.name);
-    let files;
-    try { files = fs.readdirSync(dir, { withFileTypes: true }); } catch { continue; }
-    const sessions = [];
-    // 예전 형식(agent-*.jsonl)의 서브에이전트 기록: 최근 것만 어느 세션 것인지 확인한다
-    const oldFormat = new Map();
-    for (const f of files) {
-      if (!f.isFile() || !f.name.startsWith('agent-') || !f.name.endsWith('.jsonl')) continue;
-      let st;
-      try { st = fs.statSync(path.join(dir, f.name)); } catch { continue; }
-      if (now - st.mtimeMs > ACTIVE_MS) continue;
-      const sid = subagentHead(path.join(dir, f.name), st).sessionId;
-      if (sid) oldFormat.set(sid, Math.max(oldFormat.get(sid) || 0, st.mtimeMs));
-    }
-    for (const f of files) {
-      if (!f.isFile() || !f.name.endsWith('.jsonl') || f.name.startsWith('agent-')) continue;
-      const id = f.name.slice(0, -6);
-      if (!NAME_RE.test(id)) continue;
-      const file = path.join(dir, f.name);
-      let st;
-      try { st = fs.statSync(file); } catch { continue; }
-      const info = sessionInfo(file, st);
-      if (!info.hasMessages) continue;
-      // 하루 넘게 조용한 세션은 서브에이전트 폴더까지 뒤지지 않는다
-      const mtime = now - st.mtimeMs < 86400e3 ? Math.max(st.mtimeMs, newestSubagentWrite(dir, id, oldFormat)) : st.mtimeMs;
-      sessions.push({ id, title: info.title || '제목 없는 세션', cwd: info.cwd, birth: info.birth,
-        mtime, active: now - mtime < ACTIVE_MS });
-    }
-    if (!sessions.length) continue;
-    sessions.sort((a, b) => b.mtime - a.mtime);
-    const cwd = (sessions.find(s => s.cwd) || {}).cwd || guessCwd(d.name);
-    floors.push({
-      id: d.name, cwd, name: path.basename(cwd) || d.name,
-      firstSeen: Math.min(...sessions.map(s => s.birth)),
-      lastActive: sessions[0].mtime,
-      active: sessions.some(s => s.active),
-      sessionCount: sessions.length,
-      sessions: sessions.slice(0, 30).map(({ cwd: _c, ...s }) => s),
-    });
-  }
-  floors.sort((a, b) => a.firstSeen - b.firstSeen || a.id.localeCompare(b.id));
-  floors.forEach((f, i) => { f.floor = i + 1; });
-  return floors;
-}
-
-// ---------------------------------------------------------------- 서브에이전트 기록 찾기
-
-const sideHeadCache = new Map();
-
-function subagentHead(file, st) {
-  const hit = sideHeadCache.get(file);
-  if (hit && hit.size === st.size) return hit.head;
-  const head = { sessionId: '', prompt: '', agentId: '' };
-  try {
-    for (const r of headRecords(file, st.size)) {
-      if (!head.sessionId && r.sessionId) head.sessionId = r.sessionId;
-      if (!head.agentId && r.agentId) head.agentId = String(r.agentId);
-      if (!head.prompt && r.type === 'user') {
-        const p = cleanPrompt(userText(r.message && r.message.content));
-        if (p.text) head.prompt = clip(p.text, 300);
-      }
-      if (head.sessionId && head.prompt && head.agentId) break;
-    }
-  } catch { /* 무시 */ }
-  // 첫 프롬프트가 아직 안 써졌으면 다음에 다시 읽는다
-  if (head.prompt) sideHeadCache.set(file, { size: st.size, head });
-  return head;
-}
-
-function readMeta(file) {
-  try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch { return null; }
-}
-
-function findSubagents(floorDir, sessionId) {
-  const subs = [];
-  for (const s of subagentFiles(floorDir, sessionId)) {
-    const meta = readMeta(s.file.replace(/\.jsonl$/, '.meta.json'));
-    subs.push({ key: s.name.slice(0, -6), file: s.file, agentType: meta && (meta.agentType || meta.subagent_type), wf: s.wf,
-      desc: meta && meta.description, toolUseId: meta && typeof meta.toolUseId === 'string' ? meta.toolUseId : null });
-  }
-  // 예전 버전: 프로젝트 폴더에 agent-*.jsonl 로 섞여 있다
-  try {
-    for (const f of fs.readdirSync(floorDir)) {
-      if (!f.startsWith('agent-') || !f.endsWith('.jsonl') || !NAME_RE.test(f)) continue;
-      const file = path.join(floorDir, f);
-      let st;
-      try { st = fs.statSync(file); } catch { continue; }
-      if (subagentHead(file, st).sessionId === sessionId) subs.push({ key: f.slice(0, -6), file });
-    }
-  } catch { /* 무시 */ }
-  return subs;
-}
-
-// ---------------------------------------------------------------- 증분 읽기
-
-// offset부터 새로 추가된 완성된 줄만 읽는다. 아주 긴 한 줄(이미지 등)은 건너뛴다.
-function readNew(file, offset, initialTail) {
-  const st = fs.statSync(file);
-  let start = offset;
-  let reset = false;
-  if (start == null) {
-    start = initialTail == null ? 0 : Math.max(0, st.size - initialTail);
-    if (start > 0) {
-      const probe = readRange(file, start, Math.min(st.size, start + MAX_CHUNK));
-      const nl = probe.indexOf(0x0a);
-      start = nl >= 0 ? start + nl + 1 : st.size;
-    }
-  } else if (start > st.size) { start = 0; reset = true; }
-  const end = Math.min(st.size, start + MAX_CHUNK);
-  // more: MAX_CHUNK에서 끊어 읽어 뒤에 더 읽을 줄이 남았다. 마지막 줄이 아직 덜 쓰였을 뿐이면 false다
-  const more = end < st.size;
-  if (end <= start) return { offset: start, records: [], reset, more: false, size: st.size, mtime: st.mtimeMs };
-  const buf = readRange(file, start, end);
-  const nl = buf.lastIndexOf(0x0a);
-  if (nl < 0) {
-    // 줄 하나가 MAX_CHUNK보다 크면 그 줄은 버리고 다음 줄부터 읽는다
-    const skip = buf.length === MAX_CHUNK ? end : start;
-    return { offset: skip, records: [], reset, more, size: st.size, mtime: st.mtimeMs };
-  }
-  return { offset: start + nl + 1, records: parseLines(buf.subarray(0, nl)), reset, more, size: st.size, mtime: st.mtimeMs };
-}
-
-function sessionDelta(floorId, sessionId, cursor) {
-  const floorDir = path.join(ROOT, floorId);
-  const mainFile = path.join(floorDir, sessionId + '.jsonl');
-  const initial = !cursor || typeof cursor.m !== 'number';
-  const main = readNew(mainFile, initial ? null : cursor.m, INITIAL_TAIL);
-  const events = [];
-  for (const r of main.records) events.push(...compact(r, 'main'));
-
-  const nextSubs = {};
-  const subsMeta = {};
-  const prevSubs = (cursor && cursor.s) || {};
-  const now = Date.now();
-  let lastWrite = main.mtime;
-  for (const sub of findSubagents(floorDir, sessionId)) {
-    // 파일 하나를 못 읽어도(권한, 도중에 지워짐 등) 세션 전체가 멈추지 않게 그 파일만 건너뛴다
-    try {
-      const st = fs.statSync(sub.file);
-      if (!st.isFile()) continue;
-      lastWrite = Math.max(lastWrite, st.mtimeMs);
-      const head = subagentHead(sub.file, st);
-      subsMeta[sub.key] = { prompt: head.prompt, agentId: head.agentId, agentType: sub.agentType || '', mtime: st.mtimeMs,
-        desc: typeof sub.desc === 'string' ? clip(sub.desc, 40) : '', toolUseId: sub.toolUseId || undefined };
-      if (sub.wf) subsMeta[sub.key].wf = sub.wf;
-      let off = prevSubs[sub.key];
-      let tail = null;
-      if (typeof off !== 'number') {
-        if (initial) {
-          // 처음 열 때: 끝난 지 오래된 서브에이전트는 건너뛰고, 최근 것만 끝부분을 읽는다.
-          // 긴 명령을 기다리는 동안에는 기록이 멈추므로 넉넉하게 30분까지 본다.
-          if (now - st.mtimeMs > SUB_RECENT_MS) off = st.size; else { off = null; tail = SUB_INITIAL_TAIL; }
-        } else off = 0; // 새로 생긴 서브에이전트
-      }
-      const r = readNew(sub.file, off, tail);
-      nextSubs[sub.key] = r.offset;
-      for (const rec of r.records) events.push(...compact(rec, 'sub:' + sub.key));
-    } catch {
-      // 이 서브에이전트만 건너뛰되, 읽던 위치는 지켜 다음에 처음부터 다시 읽지 않게 한다
-      if (typeof prevSubs[sub.key] === 'number') nextSubs[sub.key] = prevSubs[sub.key];
-    }
-  }
-  events.sort((a, b) => (a.t || 0) - (b.t || 0));
-  return {
-    events,
-    initial,
-    reset: main.reset,
-    cursor: { m: main.offset, s: nextSubs },
-    subs: subsMeta,
-    session: { id: sessionId, mtime: lastWrite, active: now - lastWrite < ACTIVE_MS, more: main.more },
-  };
 }
 
 // ---------------------------------------------------------------- HTTP
@@ -472,6 +65,40 @@ function serveStatic(req, res, pathname) {
   });
 }
 
+let floorsCache = { at: 0, floors: null };
+
+// GET(쿼리)과 POST(본문)가 같이 쓰는 세션 응답
+function answerSession(res, floor, session, cursor) {
+  if (!validName(floor) || !validName(session)) return sendJson(res, 400, { error: 'bad name' });
+  if (!fs.existsSync(path.join(ROOT, floor, session + '.jsonl'))) return sendJson(res, 404, { error: 'no session' });
+  return sendJson(res, 200, sessionDelta(ROOT, floor, session, cursor));
+}
+
+// 요청 본문을 JSON으로 읽어 넘긴다. 1 MiB를 넘으면 413, JSON이 아니면 400, 처리 중 오류는 500
+function readJsonBody(req, res, handle) {
+  const chunks = [];
+  let size = 0;
+  let done = false;
+  req.on('error', () => { done = true; });
+  req.on('data', c => {
+    if (done) return;
+    size += c.length;
+    if (size <= BODY_MAX) { chunks.push(c); return; }
+    done = true;
+    res.writeHead(413, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store', Connection: 'close' });
+    res.end('{"error":"too large"}');
+  });
+  req.on('end', () => {
+    if (done) return;
+    done = true;
+    let body;
+    try { body = JSON.parse(Buffer.concat(chunks).toString('utf8')); } catch { return sendJson(res, 400, { error: 'bad json' }); }
+    try { handle(body); } catch (e) {
+      if (!res.headersSent) sendJson(res, 500, { error: String(e && e.message || e) });
+    }
+  });
+}
+
 const server = http.createServer((req, res) => {
   // 다른 사이트가 이 서버를 읽어 가지 못하도록 Host 헤더를 확인한다 (DNS 리바인딩 방지).
   // localhost 같은 이름은 이 PC 안에서 온 연결에만 허용한다. 다른 기기는 Host를 마음대로 적을 수 있으므로
@@ -486,17 +113,26 @@ const server = http.createServer((req, res) => {
     let url;
     try { url = new URL(req.url, 'http://localhost'); } catch { return sendJson(res, 400, { error: 'bad url' }); }
     if (url.pathname === '/api/floors') {
-      return sendJson(res, 200, { root: ROOT, user: userName(), demo: !!args.demo, now: Date.now(), floors: listFloors() });
+      // 탭마다 따로 훑지 않도록 목록을 잠깐 함께 쓴다
+      const t = Date.now();
+      if (!floorsCache.floors || t - floorsCache.at >= FLOORS_TTL) floorsCache = { at: t, floors: listFloors(ROOT) };
+      return sendJson(res, 200, { root: ROOT, user: userName(), demo: !!args.demo, now: Date.now(), floors: floorsCache.floors });
+    }
+    if (url.pathname === '/api/session' && req.method === 'POST') {
+      // 커서를 주소에 실으면 서브에이전트가 많을 때 431이 나므로 본문으로 받는다
+      if (!(req.headers['content-type'] || '').toLowerCase().startsWith('application/json')) return sendJson(res, 415, { error: 'json only' });
+      return readJsonBody(req, res, b => {
+        const o = b && typeof b === 'object' ? b : {};
+        return answerSession(res, typeof o.floor === 'string' ? o.floor : '', typeof o.session === 'string' ? o.session : '', o.c || null);
+      });
     }
     if (url.pathname === '/api/session') {
       const floor = url.searchParams.get('floor') || '';
       const session = url.searchParams.get('session') || '';
-      if (!validName(floor) || !validName(session)) return sendJson(res, 400, { error: 'bad name' });
       let cursor = null;
       const c = url.searchParams.get('c');
       if (c) { try { cursor = JSON.parse(c); } catch { return sendJson(res, 400, { error: 'bad cursor' }); } }
-      if (!fs.existsSync(path.join(ROOT, floor, session + '.jsonl'))) return sendJson(res, 404, { error: 'no session' });
-      return sendJson(res, 200, sessionDelta(floor, session, cursor));
+      return answerSession(res, floor, session, cursor);
     }
     if (req.method !== 'GET') { res.writeHead(405); return res.end(); }
     return serveStatic(req, res, url.pathname);

@@ -10,10 +10,13 @@ const crypto = require('crypto');
 const uuid = () => crypto.randomUUID();
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 let toolSeq = 0;
+let msgSeq = 0;
 const toolId = () => 'toolu_demo' + (++toolSeq).toString().padStart(4, '0');
 
 class Writer {
-  constructor(file, base) { this.file = file; this.base = base; this.parent = null; }
+  constructor(file, base) { this.file = file; this.base = base; this.parent = null; this.ctx = 18000; }
+  // 실제 기록처럼 응답마다 ID·모델·입력 토큰 수를 붙인다 (컨텍스트는 응답할 때마다 조금씩 는다)
+  reply(o) { this.ctx += 900; return { id: 'msg_demo' + (++msgSeq), model: 'claude-demo', role: 'assistant', usage: { input_tokens: 4, cache_read_input_tokens: this.ctx, cache_creation_input_tokens: 0 }, ...o }; }
   write(rec) {
     const full = { parentUuid: this.parent, uuid: uuid(), timestamp: new Date().toISOString(), ...this.base, ...rec };
     this.parent = full.uuid;
@@ -22,11 +25,11 @@ class Writer {
   }
   prompt(text) { this.write({ type: 'user', message: { role: 'user', content: text } }); }
   command(name) { this.write({ type: 'user', message: { role: 'user', content: `<command-name>${name}</command-name>\n<command-message>${name.slice(1)}</command-message>` } }); }
-  think(text) { this.write({ type: 'assistant', message: { role: 'assistant', content: [{ type: 'thinking', thinking: text, signature: 'demo' }] } }); }
-  text(text, stop = 'end_turn') { this.write({ type: 'assistant', message: { role: 'assistant', stop_reason: stop, content: [{ type: 'text', text }] } }); }
+  think(text) { this.write({ type: 'assistant', message: this.reply({ content: [{ type: 'thinking', thinking: text, signature: 'demo' }] }) }); }
+  text(text, stop = 'end_turn') { this.write({ type: 'assistant', message: this.reply({ stop_reason: stop, content: [{ type: 'text', text }] }) }); }
   tool(name, input) {
     const id = toolId();
-    this.write({ type: 'assistant', message: { role: 'assistant', stop_reason: 'tool_use', content: [{ type: 'tool_use', id, name, input }] } });
+    this.write({ type: 'assistant', message: this.reply({ stop_reason: 'tool_use', content: [{ type: 'tool_use', id, name, input }] }) });
     return id;
   }
   result(id, content, isError = false, extra = {}) {
@@ -77,7 +80,7 @@ async function mainScenario(root) {
   const dir = projectDir(root, cwd);
   for (;;) {
     const sid = uuid();
-    const w = new Writer(path.join(dir, sid + '.jsonl'), { sessionId: sid, cwd, isSidechain: false, version: 'demo' });
+    const w = new Writer(path.join(dir, sid + '.jsonl'), { sessionId: sid, cwd, isSidechain: false, version: 'demo', gitBranch: 'fix/token-refresh' });
     w.command('/clear');
     await sleep(800);
     w.prompt('로그인하면 가끔 튕기는 버그 고쳐줘. 테스트도 돌려보고.');

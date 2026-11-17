@@ -187,7 +187,7 @@ export function buildWorld(themeIndex) {
       return g.h * BH;
     },
   };
-  world.groundCanvas = renderGround(world);
+  // 바닥 그림(groundCanvas)은 처음 그릴 때 render()가 만든다. 여기서는 화면 없이도 쓸 수 있는 자료만 만든다
   return world;
 }
 
@@ -1234,6 +1234,7 @@ export function render(ctx, world, cam, chars, live, t) {
 
   const s = cam.scale * dpr;
   ctx.setTransform(s, 0, 0, s, cam.x * dpr, cam.y * dpr);
+  if (!world.groundCanvas) world.groundCanvas = renderGround(world);
   ctx.drawImage(world.groundCanvas, BOUNDS.minX, BOUNDS.minY, BOUNDS.w, BOUNDS.h);
   drawWater(ctx, world, t);
 
